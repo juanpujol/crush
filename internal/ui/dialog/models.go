@@ -203,7 +203,10 @@ func (m *Models) Update(msg tea.Msg) tea.Msg {
 				break
 			}
 
+			// <------- HERE ------->
+
 			return ModelSelectedMsg{
+				Provider:  modelItem.prov,
 				Model:     modelItem.SelectedModel(),
 				ModelType: modelItem.SelectedModelType(),
 			}

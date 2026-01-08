@@ -18,6 +18,7 @@ import (
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
@@ -756,6 +757,14 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				if cmd := m.openModelsDialog(); cmd != nil {
 					cmds = append(cmds, cmd)
 				}
+			// case dialog.APIKeyInputID:
+			// 	var (
+			// 		providerID, _ = msg.Data["provider_id"].(string)
+			// 		modelID, _    = msg.Data["model_id"].(string)
+			// 	)
+			// 	if cmd := m.openAPIKeyInputDialog(providerID, modelID); cmd != nil {
+			// 		cmds = append(cmds, cmd)
+			// 	}
 			default:
 				// Unknown dialog
 				break
@@ -796,11 +805,18 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				break
 			}
 
-			// TODO: Validate model API and authentication here?
-
 			cfg := m.com.Config()
 			if cfg == nil {
 				cmds = append(cmds, uiutil.ReportError(errors.New("configuration not found")))
+				break
+			}
+
+			_, isProviderConfigured := cfg.Providers.Get(msg.Model.Provider)
+			if !isProviderConfigured {
+				m.dialog.CloseDialog(dialog.ModelsID)
+				if cmd := m.openAPIKeyInputDialog(msg.Provider, msg.Model.Model); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
 				break
 			}
 
@@ -1892,6 +1908,21 @@ func (m *UI) openSessionsDialog() tea.Cmd {
 	dialog.SetSize(min(120, m.width-8), 30)
 	m.dialog.OpenDialog(dialog)
 
+	return nil
+}
+
+// openAPIKeyInputDialog opens the API key input dialog.
+func (m *UI) openAPIKeyInputDialog(provider catwalk.Provider, modelID string) tea.Cmd {
+	if m.dialog.ContainsDialog(dialog.APIKeyInputID) {
+		m.dialog.BringToFront(dialog.APIKeyInputID)
+		return nil
+	}
+
+	apiKeyInputDialog, err := dialog.NewAPIKeyInput(m.com, provider, modelID)
+	if err != nil {
+		return uiutil.ReportError(err)
+	}
+	m.dialog.OpenDialog(apiKeyInputDialog)
 	return nil
 }
 

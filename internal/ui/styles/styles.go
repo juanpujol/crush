@@ -292,9 +292,13 @@ type Styles struct {
 
 	// Dialog styles
 	Dialog struct {
-		Title lipgloss.Style
+		Title       lipgloss.Style
+		TitleText   lipgloss.Style
+		TitleAccent lipgloss.Style
 		// View is the main content area style.
-		View lipgloss.Style
+		View          lipgloss.Style
+		PrimaryText   lipgloss.Style
+		SecondaryText lipgloss.Style
 		// HelpView is the line that contains the help.
 		HelpView lipgloss.Style
 		Help     struct {
@@ -1148,7 +1152,11 @@ func DefaultStyles() Styles {
 
 	// Dialog styles
 	s.Dialog.Title = base.Padding(0, 1).Foreground(primary)
+	s.Dialog.TitleText = base.Foreground(primary)
+	s.Dialog.TitleAccent = base.Foreground(green).Bold(true)
 	s.Dialog.View = base.Border(lipgloss.RoundedBorder()).BorderForeground(borderFocus)
+	s.Dialog.PrimaryText = base.Padding(0, 1).Foreground(primary)
+	s.Dialog.SecondaryText = base.Padding(0, 1).Foreground(fgSubtle)
 	s.Dialog.HelpView = base.Padding(0, 1).AlignHorizontal(lipgloss.Left)
 	s.Dialog.Help.ShortKey = base.Foreground(fgMuted)
 	s.Dialog.Help.ShortDesc = base.Foreground(fgSubtle)
