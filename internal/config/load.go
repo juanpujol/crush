@@ -27,6 +27,7 @@ import (
 	"github.com/charmbracelet/crush/internal/filepathext"
 	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/home"
+	"github.com/charmbracelet/crush/internal/oauth/chatgpt"
 	"github.com/charmbracelet/crush/internal/shellconfig"
 	powernapConfig "github.com/charmbracelet/x/powernap/pkg/config"
 	"github.com/qjebbs/go-jsons"
@@ -212,6 +213,7 @@ func PushPopCrushEnv() func() {
 
 func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env env.Env, resolver VariableResolver, knownProviders []catwalk.Provider) error {
 	knownProviderNames := make(map[string]bool)
+	bootstrapModelInjected := make(map[string]bool)
 	restore := PushPopCrushEnv()
 	defer restore()
 
@@ -226,6 +228,12 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 	for _, p := range knownProviders {
 		knownProviderNames[string(p.ID)] = true
 		config, configExists := c.Providers.Get(string(p.ID))
+		if p.ID == catwalk.InferenceProvider(chatgpt.ProviderID) &&
+			!slices.ContainsFunc(config.Models, func(model catwalk.Model) bool {
+				return model.ID == codexBootstrapModelID
+			}) {
+			bootstrapModelInjected[string(p.ID)] = true
+		}
 		// if the user configured a known provider we need to allow it to override a couple of parameters
 		if configExists {
 			if config.BaseURL != "" {
@@ -393,7 +401,7 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 
 	discoverCtx, discoverCancel := context.WithTimeout(ctx, 3*time.Second)
 	for id, pc := range c.Providers.Seq2() {
-		if knownProviderNames[id] {
+		if knownProviderNames[id] && id != chatgpt.ProviderID {
 			continue
 		}
 		if pc.Disable || pc.BaseURL == "" {
@@ -411,6 +419,15 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 			APIKey:         pc.APIKey,
 			ExtraHeaders:   pc.ExtraHeaders,
 			ExistingModels: pc.Models,
+		}
+		if id == chatgpt.ProviderID {
+			// The bootstrap model only makes the provider selectable before
+			// login. Preserve explicitly configured models during discovery.
+			if bootstrapModelInjected[id] {
+				cfg.ExistingModels = slices.DeleteFunc(slices.Clone(pc.Models), func(model catwalk.Model) bool {
+					return model.ID == codexBootstrapModelID
+				})
+			}
 		}
 		providerType := cmp.Or(pc.Type, catwalk.TypeOpenAICompat)
 		wg.Go(func() {
@@ -430,7 +447,7 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 
 	// Validate the custom providers.
 	for id, providerConfig := range c.Providers.Seq2() {
-		if knownProviderNames[id] {
+		if knownProviderNames[id] && id != chatgpt.ProviderID {
 			continue
 		}
 

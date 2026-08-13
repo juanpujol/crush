@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,39 +11,20 @@ import (
 	"testing"
 	"time"
 
+	"charm.land/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/oauth"
+	"github.com/charmbracelet/crush/internal/oauth/chatgpt"
 	"github.com/stretchr/testify/require"
 )
 
-// writeTokenToDisk persists token as the hyper provider credential in the
-// config file at path, mimicking what another crush instance would leave
-// behind after a successful refresh.
-func writeTokenToDisk(t *testing.T, path string, token *oauth.Token) {
-	t.Helper()
-	configContent := fmt.Sprintf(`{
-		"providers": {
-			"hyper": {
-				"api_key": %q,
-				"oauth": {
-					"access_token": %q,
-					"refresh_token": %q,
-					"expires_in": %d,
-					"expires_at": %d
-				}
-			}
-		}
-	}`, token.AccessToken, token.AccessToken, token.RefreshToken, token.ExpiresIn, token.ExpiresAt)
-	require.NoError(t, os.WriteFile(path, []byte(configContent), 0o600))
-}
-
-// newRefreshTestStore builds a ConfigStore whose hyper provider holds an
+// newRefreshTestStore builds a ConfigStore whose selected provider holds an
 // expired OAuth token, persisted both in memory and on disk at configPath.
 // Stores that share a configPath also share the per-provider refresh lock,
 // which lets a single test process faithfully simulate two crush instances:
 // lock.File opens a fresh descriptor per call, so two stores block each
 // other on the same lock file exactly as two processes would.
-func newRefreshTestStore(t *testing.T, configPath string, exchange func(ctx context.Context, providerID, refreshToken string) (*oauth.Token, error)) *ConfigStore {
+func newRefreshTestStore(t *testing.T, configPath, providerID string, exchange func(ctx context.Context, providerID string, provider ProviderConfig) (*oauth.Token, error)) *ConfigStore {
 	t.Helper()
 
 	expired := &oauth.Token{
@@ -51,14 +33,43 @@ func newRefreshTestStore(t *testing.T, configPath string, exchange func(ctx cont
 		ExpiresIn:    3600,
 		ExpiresAt:    time.Now().Add(-time.Hour).Unix(),
 	}
-	writeTokenToDisk(t, configPath, expired)
+	providerData := map[string]any{
+		"id":              providerID,
+		"name":            providerID,
+		"type":            catwalk.TypeOpenAI,
+		"base_url":        "https://example.com",
+		"discover_models": false,
+		"models": []catwalk.Model{{
+			ID:   "test-model",
+			Name: "Test Model",
+		}},
+		"api_key": expired.AccessToken,
+		"oauth":   expired,
+	}
+	extraHeaders := map[string]string(nil)
+	if providerID == chatgpt.ProviderID {
+		extraHeaders = map[string]string{chatgpt.AccountIDHeader: "account-1"}
+		providerData["extra_headers"] = extraHeaders
+	}
+	configContent, err := json.Marshal(map[string]any{
+		"providers": map[string]any{
+			providerID: providerData,
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(configPath, configContent, 0o600))
 
 	providers := csync.NewMap[string, ProviderConfig]()
-	providers.Set("hyper", ProviderConfig{
-		ID:         "hyper",
-		Name:       "Hyper",
-		APIKey:     expired.AccessToken,
-		OAuthToken: expired,
+	providers.Set(providerID, ProviderConfig{
+		ID:           providerID,
+		Name:         providerID,
+		APIKey:       expired.AccessToken,
+		OAuthToken:   expired,
+		ExtraHeaders: extraHeaders,
+		Models: []catwalk.Model{{
+			ID:   "test-model",
+			Name: "Test Model",
+		}},
 	})
 
 	return &ConfigStore{
@@ -67,6 +78,37 @@ func newRefreshTestStore(t *testing.T, configPath string, exchange func(ctx cont
 		workingDir:     filepath.Dir(configPath),
 		exchangeToken:  exchange,
 	}
+}
+
+func writeTokenToDisk(t *testing.T, path string, token *oauth.Token) {
+	t.Helper()
+	configContent, err := json.Marshal(map[string]any{
+		"providers": map[string]any{
+			"hyper": map[string]any{
+				"api_key": token.AccessToken,
+				"oauth":   token,
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, configContent, 0o600))
+}
+
+func writeCodexAuthToDisk(t *testing.T, path string, token *oauth.Token, accountID string) {
+	t.Helper()
+	configContent, err := json.Marshal(map[string]any{
+		"providers": map[string]any{
+			chatgpt.ProviderID: map[string]any{
+				"api_key": token.AccessToken,
+				"oauth":   token,
+				"extra_headers": map[string]string{
+					chatgpt.AccountIDHeader: accountID,
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, configContent, 0o600))
 }
 
 // TestRefreshOAuthToken_InProcessSingleFlight verifies that a storm of
@@ -78,7 +120,7 @@ func TestRefreshOAuthToken_InProcessSingleFlight(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "crush.json")
 
 	var exchanges atomic.Int64
-	store := newRefreshTestStore(t, configPath, func(ctx context.Context, providerID, refreshToken string) (*oauth.Token, error) {
+	store := newRefreshTestStore(t, configPath, "hyper", func(ctx context.Context, providerID string, provider ProviderConfig) (*oauth.Token, error) {
 		exchanges.Add(1)
 		time.Sleep(50 * time.Millisecond) // hold the flight open so peers join
 		return &oauth.Token{
@@ -123,63 +165,65 @@ func TestRefreshOAuthToken_InProcessSingleFlight(t *testing.T) {
 func TestRefreshOAuthToken_CrossProcessAdopt(t *testing.T) {
 	t.Parallel()
 
-	configPath := filepath.Join(t.TempDir(), "crush.json")
+	for _, providerID := range []string{"hyper", chatgpt.ProviderID} {
+		t.Run(providerID, func(t *testing.T) {
+			t.Parallel()
 
-	var (
-		mu          sync.Mutex
-		current     = "rt0" // the only refresh token the server will accept
-		exchanges   atomic.Int64
-		reuseErrors atomic.Int64
-	)
-	exchange := func(ctx context.Context, providerID, refreshToken string) (*oauth.Token, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		if refreshToken != current {
-			reuseErrors.Add(1)
-			return nil, fmt.Errorf("refresh token revoked")
-		}
-		exchanges.Add(1)
-		time.Sleep(50 * time.Millisecond) // hold the lock so the peer must wait
-		current = "rt1"
-		return &oauth.Token{
-			AccessToken:  "at1",
-			RefreshToken: "rt1",
-			ExpiresIn:    3600,
-			ExpiresAt:    time.Now().Add(time.Hour).Unix(),
-		}, nil
-	}
+			configPath := filepath.Join(t.TempDir(), "crush.json")
+			var (
+				mu          sync.Mutex
+				current     = "rt0"
+				exchanges   atomic.Int64
+				reuseErrors atomic.Int64
+			)
+			exchange := func(ctx context.Context, providerID string, provider ProviderConfig) (*oauth.Token, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				refreshToken := provider.OAuthToken.RefreshToken
+				if refreshToken != current {
+					reuseErrors.Add(1)
+					return nil, fmt.Errorf("refresh token revoked")
+				}
+				exchanges.Add(1)
+				time.Sleep(50 * time.Millisecond)
+				current = "rt1"
+				return &oauth.Token{
+					AccessToken:  "at1",
+					RefreshToken: "rt1",
+					ExpiresIn:    3600,
+					ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+				}, nil
+			}
 
-	// Two stores sharing the same config file and refresh lock = two
-	// "processes".
-	a := newRefreshTestStore(t, configPath, exchange)
-	b := newRefreshTestStore(t, configPath, exchange)
+			a := newRefreshTestStore(t, configPath, providerID, exchange)
+			b := newRefreshTestStore(t, configPath, providerID, exchange)
 
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	errs := make(chan error, 2)
-	for _, s := range []*ConfigStore{a, b} {
-		wg.Go(func() {
-			<-start
-			errs <- s.RefreshOAuthToken(context.Background(), ScopeGlobal, "hyper")
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			errs := make(chan error, 2)
+			for _, store := range []*ConfigStore{a, b} {
+				wg.Go(func() {
+					<-start
+					errs <- store.RefreshOAuthToken(context.Background(), ScopeGlobal, providerID)
+				})
+			}
+			close(start)
+			wg.Wait()
+			close(errs)
+
+			for err := range errs {
+				require.NoError(t, err)
+			}
+			require.Equal(t, int64(1), exchanges.Load(), "only one instance should exchange")
+			require.Equal(t, int64(0), reuseErrors.Load(), "no instance should reuse a rotated refresh token")
+
+			for name, store := range map[string]*ConfigStore{"a": a, "b": b} {
+				provider, ok := store.config.Providers.Get(providerID)
+				require.True(t, ok, name)
+				require.Equal(t, "at1", provider.OAuthToken.AccessToken, name)
+				require.Equal(t, "rt1", provider.OAuthToken.RefreshToken, name)
+			}
 		})
-	}
-	close(start)
-	wg.Wait()
-	close(errs)
-
-	for err := range errs {
-		require.NoError(t, err)
-	}
-
-	require.Equal(t, int64(1), exchanges.Load(), "only one instance should exchange")
-	require.Equal(t, int64(0), reuseErrors.Load(), "no instance should reuse a rotated refresh token")
-
-	// Both instances converge on the rotated token.
-	for name, s := range map[string]*ConfigStore{"a": a, "b": b} {
-		pc, ok := s.config.Providers.Get("hyper")
-		require.True(t, ok, name)
-		require.Equal(t, "at1", pc.OAuthToken.AccessToken, name)
-		require.Equal(t, "rt1", pc.OAuthToken.RefreshToken, name)
 	}
 }
 
@@ -188,15 +232,16 @@ func TestRefreshOAuthToken_CrossProcessAdopt(t *testing.T) {
 // live refresh token fails the way a real reuse-detecting server would.
 // Tokens are handed out as at<n>/rt<n> starting at next. The returned
 // counters report successful exchanges and reuse attempts.
-func rotatingExchange(live string, next int) (exchange func(ctx context.Context, providerID, refreshToken string) (*oauth.Token, error), exchanges, reuse *atomic.Int64) {
+func rotatingExchange(live string, next int) (exchange func(ctx context.Context, providerID string, provider ProviderConfig) (*oauth.Token, error), exchanges, reuse *atomic.Int64) {
 	var (
 		mu        sync.Mutex
 		exchanged atomic.Int64
 		reused    atomic.Int64
 	)
-	return func(ctx context.Context, providerID, refreshToken string) (*oauth.Token, error) {
+	return func(ctx context.Context, providerID string, provider ProviderConfig) (*oauth.Token, error) {
 		mu.Lock()
 		defer mu.Unlock()
+		refreshToken := provider.OAuthToken.RefreshToken
 		if refreshToken != live {
 			reused.Add(1)
 			return nil, &oauth.TokenExchangeError{StatusCode: 400, Body: `{"error":"invalid_grant"}`}
@@ -226,7 +271,7 @@ func TestRefreshOAuthToken_StalePeerBorrowsRotatedRefreshToken(t *testing.T) {
 
 	configPath := filepath.Join(t.TempDir(), "crush.json")
 	exchange, exchanges, reuse := rotatingExchange("rt3", 4)
-	store := newRefreshTestStore(t, configPath, exchange)
+	store := newRefreshTestStore(t, configPath, "hyper", exchange)
 
 	// Disk holds the peer's third rotation, whose access token has also
 	// expired. In memory we are still back on the original credential.
@@ -256,7 +301,7 @@ func TestRefreshOAuthToken_AdoptsFresherDiskToken(t *testing.T) {
 
 	configPath := filepath.Join(t.TempDir(), "crush.json")
 	exchange, exchanges, _ := rotatingExchange("rt9", 10)
-	store := newRefreshTestStore(t, configPath, exchange)
+	store := newRefreshTestStore(t, configPath, "hyper", exchange)
 
 	writeTokenToDisk(t, configPath, &oauth.Token{
 		AccessToken:  "at9",
@@ -274,6 +319,58 @@ func TestRefreshOAuthToken_AdoptsFresherDiskToken(t *testing.T) {
 	require.Equal(t, "at9", pc.APIKey)
 }
 
+func TestRefreshOAuthToken_AdoptsCodexAccountMetadata(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "crush.json")
+	store := newRefreshTestStore(t, configPath, chatgpt.ProviderID, func(context.Context, string, ProviderConfig) (*oauth.Token, error) {
+		return nil, fmt.Errorf("exchange should not run")
+	})
+	provider, ok := store.config.Providers.Get(chatgpt.ProviderID)
+	require.True(t, ok)
+	provider.ExtraHeaders = map[string]string{chatgpt.AccountIDHeader: "account-old"}
+	store.config.Providers.Set(chatgpt.ProviderID, provider)
+
+	diskToken := &oauth.Token{
+		AccessToken:  "at-new",
+		RefreshToken: "rt-new",
+		ExpiresIn:    3600,
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}
+	writeCodexAuthToDisk(t, configPath, diskToken, "account-new")
+
+	require.NoError(t, store.RefreshOAuthToken(context.Background(), ScopeGlobal, chatgpt.ProviderID))
+	adopted, ok := store.config.Providers.Get(chatgpt.ProviderID)
+	require.True(t, ok)
+	require.Equal(t, "at-new", adopted.APIKey)
+	require.Equal(t, "account-new", adopted.ExtraHeaders[chatgpt.AccountIDHeader])
+}
+
+func TestSyncDiskAuthRejectsDifferentTokenSnapshot(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "crush.json")
+	store := newRefreshTestStore(t, configPath, chatgpt.ProviderID, nil)
+	writeCodexAuthToDisk(t, configPath, &oauth.Token{
+		AccessToken:  "at-newer",
+		RefreshToken: "rt-newer",
+		ExpiresIn:    3600,
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}, "account-newer")
+
+	provider := ProviderConfig{ExtraHeaders: map[string]string{
+		chatgpt.AccountIDHeader: "account-old",
+		"X-Custom":              "resolved-value",
+	}}
+	err := store.syncDiskAuth(ScopeGlobal, chatgpt.ProviderID, &oauth.Token{
+		AccessToken:  "at-expected",
+		RefreshToken: "rt-expected",
+	}, &provider)
+	require.ErrorContains(t, err, "credentials changed")
+	require.Equal(t, "account-old", provider.ExtraHeaders[chatgpt.AccountIDHeader])
+	require.Equal(t, "resolved-value", provider.ExtraHeaders["X-Custom"])
+}
+
 // TestRefreshOAuthToken_IgnoresOlderDiskToken guards against walking
 // backwards: a config file holding an older credential than the one we
 // already have must not be adopted or borrowed from.
@@ -282,7 +379,7 @@ func TestRefreshOAuthToken_IgnoresOlderDiskToken(t *testing.T) {
 
 	configPath := filepath.Join(t.TempDir(), "crush.json")
 	exchange, exchanges, reuse := rotatingExchange("rt0", 1)
-	store := newRefreshTestStore(t, configPath, exchange)
+	store := newRefreshTestStore(t, configPath, "hyper", exchange)
 
 	writeTokenToDisk(t, configPath, &oauth.Token{
 		AccessToken:  "ancient",

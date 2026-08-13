@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/crush/internal/clipboard"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/oauth"
+	"github.com/charmbracelet/crush/internal/oauth/chatgpt"
 	"github.com/charmbracelet/crush/internal/oauth/copilot"
 	"github.com/charmbracelet/crush/internal/oauth/hyper"
 	"github.com/charmbracelet/crush/internal/workspace"
@@ -23,7 +24,7 @@ var loginCmd = &cobra.Command{
 	Short:   "Login Crush to a platform",
 	Long: `Login Crush to a specified platform.
 The platform should be provided as an argument.
-Available platforms are: hyper, copilot.`,
+Available platforms are: hyper, copilot, codex.`,
 	Example: `
 # Authenticate with Charm Hyper
 crush login
@@ -31,12 +32,17 @@ crush login
 # Authenticate with GitHub Copilot
 crush login copilot
 
+# Authenticate with ChatGPT Codex
+crush login codex
+
 # Force re-authentication even if already logged in
-crush login -f copilot
+crush login -f codex
   `,
 	ValidArgs: []cobra.Completion{
 		"hyper",
 		"copilot",
+		"codex",
+		"openai-codex",
 		"github",
 		"github-copilot",
 	},
@@ -58,6 +64,8 @@ crush login -f copilot
 			return loginHyper(ws, force)
 		case "copilot", "github", "github-copilot":
 			return loginCopilot(ws, force)
+		case "codex", chatgpt.ProviderID:
+			return loginCodex(ws, force)
 		default:
 			return fmt.Errorf("unknown platform: %s", args[0])
 		}
@@ -66,6 +74,70 @@ crush login -f copilot
 
 func init() {
 	loginCmd.Flags().BoolP("force", "f", false, "Force re-authentication even if already logged in")
+}
+
+type codexLoginStore interface {
+	Config() *config.Config
+	SetConfigField(scope config.Scope, key string, value any) error
+}
+
+func loginCodex(store codexLoginStore, force bool) error {
+	if !force {
+		cfg := store.Config()
+		if cfg != nil {
+			if provider, ok := cfg.Providers.Get(chatgpt.ProviderID); ok && provider.OAuthToken != nil {
+				fmt.Println("You are already logged in to ChatGPT Codex.")
+				fmt.Println("Use --force to re-authenticate.")
+				return nil
+			}
+		}
+	}
+
+	ctx := getLoginContext()
+	client := chatgpt.NewClient()
+	device, err := client.RequestDeviceCode(ctx)
+	if err != nil {
+		return err
+	}
+
+	clipboard.WriteText(device.UserCode)
+	fmt.Println("The following code should be on clipboard already:")
+	fmt.Println()
+	lipgloss.Println(lipgloss.NewStyle().Bold(true).Render(device.UserCode))
+	fmt.Println()
+	fmt.Println("Press enter to open this URL, and then enter the code:")
+	fmt.Println()
+	lipgloss.Println(lipgloss.NewStyle().Hyperlink(device.VerificationURL, "id=codex").Render(device.VerificationURL))
+	fmt.Println()
+	waitEnter()
+	if err := browser.OpenURL(device.VerificationURL); err != nil {
+		fmt.Println("Could not open the URL. You'll need to manually open the URL in your browser.")
+	}
+
+	fmt.Println("Waiting for authorization...")
+	authorization, err := client.PollAuthorization(ctx, device)
+	if err != nil {
+		return err
+	}
+	auth, err := client.ExchangeAuthorization(ctx, authorization)
+	if err != nil {
+		return err
+	}
+	if err := persistCodexLogin(store, auth); err != nil {
+		return fmt.Errorf("save ChatGPT Codex credentials: %w", err)
+	}
+
+	fmt.Println()
+	fmt.Println("You're now authenticated with ChatGPT Codex!")
+	return nil
+}
+
+func persistCodexLogin(store codexLoginStore, auth chatgpt.AuthResult) error {
+	return store.SetConfigField(
+		config.ScopeGlobal,
+		"providers."+chatgpt.ProviderID,
+		config.NewCodexProviderConfig(auth),
+	)
 }
 
 func loginHyper(ws workspace.Workspace, force bool) error {

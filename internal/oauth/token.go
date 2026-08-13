@@ -88,6 +88,10 @@ func (e *TokenExchangeError) Error() string {
 // refresh token was revoked or invalidated by the provider. This indicates
 // that interactive re-authentication is required.
 func (e *TokenExchangeError) IsRefreshTokenRevoked() bool {
-	return strings.Contains(e.Body, "revoked") ||
-		strings.Contains(e.Body, "invalid_grant")
+	body := strings.ToLower(e.Body)
+	return strings.Contains(body, "revoked") ||
+		strings.Contains(body, "invalid_grant") ||
+		strings.Contains(body, "refresh_token_expired") ||
+		strings.Contains(body, "refresh_token_reused") ||
+		strings.Contains(body, "refresh_token_invalidated")
 }

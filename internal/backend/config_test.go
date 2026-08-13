@@ -112,6 +112,15 @@ func TestSetProviderAPIKey_PublishesConfigChanged(t *testing.T) {
 	awaitConfigChanged(t, evc, ws.ID)
 }
 
+func TestSetProviderAPIKey_SignalsAuthComplete(t *testing.T) {
+	b, ws, _ := newPublishingWorkspace(t)
+
+	require.NoError(t, b.SetProviderAPIKey(ws.ID, config.ScopeGlobal, "openai", "test-key"))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, ws.Cfg.WaitForTokenChange(ctx, "openai"))
+}
+
 func TestMarkProjectInitialized_PublishesConfigChanged(t *testing.T) {
 	b, ws, evc := newPublishingWorkspace(t)
 

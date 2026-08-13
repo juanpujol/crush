@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -17,6 +18,7 @@ import (
 	"github.com/charmbracelet/crush/internal/env"
 	"github.com/charmbracelet/crush/internal/lock"
 	"github.com/charmbracelet/crush/internal/oauth"
+	"github.com/charmbracelet/crush/internal/oauth/chatgpt"
 	"github.com/charmbracelet/crush/internal/oauth/copilot"
 	"github.com/charmbracelet/crush/internal/oauth/hyper"
 	"github.com/tidwall/gjson"
@@ -119,7 +121,11 @@ type ConfigStore struct {
 	// It is a field so tests can substitute a fake exchange without making
 	// real network calls. Production code leaves it nil, and exchange falls
 	// back to the real provider clients.
-	exchangeToken func(ctx context.Context, providerID, refreshToken string) (*oauth.Token, error)
+	exchangeToken func(ctx context.Context, providerID string, provider ProviderConfig) (*oauth.Token, error)
+
+	// chatGPTClient is injectable so protocol tests can use an httptest
+	// server while still exercising the production exchange dispatch.
+	chatGPTClient *chatgpt.Client
 
 	// authSignalMu guards authSignals, which maps provider IDs to
 	// channels that WaitForTokenChange blocks on. SignalAuthComplete
@@ -356,7 +362,22 @@ func (s *ConfigStore) HasConfigField(scope Scope, key string) bool {
 // After a successful write, it automatically reloads config to keep in-memory
 // state fresh.
 func (s *ConfigStore) SetConfigField(scope Scope, key string, value any) error {
-	return s.SetConfigFields(scope, map[string]any{key: value})
+	write := func() error {
+		return s.SetConfigFields(scope, map[string]any{key: value})
+	}
+	var err error
+	if key == "providers."+chatgpt.ProviderID {
+		err = s.withRefreshLock(chatgpt.ProviderID, write)
+	} else {
+		err = write()
+	}
+	if err != nil {
+		return err
+	}
+	if key == "providers."+chatgpt.ProviderID {
+		s.SignalAuthComplete(chatgpt.ProviderID)
+	}
+	return nil
 }
 
 // SetConfigFields sets multiple key/value pairs in the config file for the
@@ -693,6 +714,9 @@ func (s *ConfigStore) refreshOAuthTokenLocked(ctx context.Context, scope Scope, 
 		// would risk reusing a rotated refresh token.
 		if diskToken := s.usableDiskToken(scope, providerID, entryToken); diskToken != nil {
 			slog.Warn("Refresh lock unavailable; adopting token from disk", "provider", providerID, "error", lockErr)
+			if err := s.syncDiskAuth(scope, providerID, diskToken, &providerConfig); err != nil {
+				return err
+			}
 			return s.applyToken(providerConfig, diskToken, providerID)
 		}
 		return fmt.Errorf("acquire refresh lock for provider %s: %w", providerID, lockErr)
@@ -708,15 +732,23 @@ func (s *ConfigStore) refreshOAuthTokenLocked(ctx context.Context, scope Scope, 
 	if diskToken := s.newerDiskToken(scope, providerID, entryToken); diskToken != nil {
 		if !diskToken.IsExpired() {
 			slog.Info("Adopting token refreshed by another session", "provider", providerID)
+			if err := s.syncDiskAuth(scope, providerID, diskToken, &providerConfig); err != nil {
+				return err
+			}
 			return s.applyToken(providerConfig, diskToken, providerID)
 		}
 		slog.Info("Exchanging with refresh token rotated by another session", "provider", providerID)
+		if err := s.syncDiskAuth(scope, providerID, diskToken, &providerConfig); err != nil {
+			return err
+		}
 		entryToken = diskToken
+		providerConfig.OAuthToken = diskToken
+		providerConfig.APIKey = diskToken.AccessToken
 	}
 
 	// Disk still holds our token (or no newer peer token exists) and we hold
 	// the lock, so we are the sole exchanger. Perform the exchange.
-	refreshedToken, refreshErr := s.exchange(ctx, providerID, entryToken.RefreshToken)
+	refreshedToken, refreshErr := s.exchange(ctx, providerID, providerConfig)
 	if refreshErr != nil {
 		// The exchange may have failed because a peer rotated the refresh
 		// token in a window we did not cover. Re-check disk: adopt a usable
@@ -724,10 +756,18 @@ func (s *ConfigStore) refreshOAuthTokenLocked(ctx context.Context, scope Scope, 
 		if diskToken := s.newerDiskToken(scope, providerID, entryToken); diskToken != nil {
 			if !diskToken.IsExpired() {
 				slog.Info("Adopting token refreshed by another session after exchange failure", "provider", providerID)
+				if err := s.syncDiskAuth(scope, providerID, diskToken, &providerConfig); err != nil {
+					return err
+				}
 				return s.applyToken(providerConfig, diskToken, providerID)
 			}
 			slog.Info("Retrying exchange with refresh token rotated by another session", "provider", providerID)
-			refreshedToken, refreshErr = s.exchange(ctx, providerID, diskToken.RefreshToken)
+			if err := s.syncDiskAuth(scope, providerID, diskToken, &providerConfig); err != nil {
+				return err
+			}
+			providerConfig.OAuthToken = diskToken
+			providerConfig.APIKey = diskToken.AccessToken
+			refreshedToken, refreshErr = s.exchange(ctx, providerID, providerConfig)
 		}
 	}
 	if refreshErr != nil {
@@ -860,15 +900,29 @@ func (s *ConfigStore) usableDiskToken(scope Scope, providerID string, entryToken
 // exchange performs the provider-specific OAuth token exchange. Tests may
 // override it via the exchangeToken field; production uses the real
 // provider clients.
-func (s *ConfigStore) exchange(ctx context.Context, providerID, refreshToken string) (*oauth.Token, error) {
+func (s *ConfigStore) exchange(ctx context.Context, providerID string, provider ProviderConfig) (*oauth.Token, error) {
 	if s.exchangeToken != nil {
-		return s.exchangeToken(ctx, providerID, refreshToken)
+		return s.exchangeToken(ctx, providerID, provider)
 	}
 	switch providerID {
 	case string(catwalk.InferenceProviderCopilot):
-		return copilot.RefreshToken(ctx, refreshToken)
+		return copilot.RefreshToken(ctx, provider.OAuthToken.RefreshToken)
 	case hyperp.Name:
-		return hyper.ExchangeToken(ctx, refreshToken)
+		return hyper.ExchangeToken(ctx, provider.OAuthToken.RefreshToken)
+	case chatgpt.ProviderID:
+		client := s.chatGPTClient
+		if client == nil {
+			client = chatgpt.NewClient()
+		}
+		result, err := client.Refresh(
+			ctx,
+			provider.OAuthToken,
+			provider.ExtraHeaders[chatgpt.AccountIDHeader],
+		)
+		if err != nil {
+			return nil, err
+		}
+		return result.Token, nil
 	default:
 		return nil, fmt.Errorf("OAuth refresh not supported for provider %s", providerID)
 	}
@@ -910,6 +964,48 @@ func (s *ConfigStore) applyToken(providerConfig ProviderConfig, token *oauth.Tok
 		providerConfig.SetupGitHubCopilot()
 	}
 	s.Config().Providers.Set(providerID, providerConfig)
+	return nil
+}
+
+func (s *ConfigStore) syncDiskAuth(scope Scope, providerID string, expected *oauth.Token, providerConfig *ProviderConfig) error {
+	if providerID != chatgpt.ProviderID {
+		return nil
+	}
+	path, err := s.configPath(scope)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read provider authentication metadata: %w", err)
+	}
+	oauthPath := fmt.Sprintf("providers.%s.oauth", providerID)
+	var token oauth.Token
+	if err := json.Unmarshal([]byte(gjson.Get(string(data), oauthPath).Raw), &token); err != nil {
+		return fmt.Errorf("decode provider token metadata: %w", err)
+	}
+	if token.AccessToken != expected.AccessToken || token.RefreshToken != expected.RefreshToken {
+		return errors.New("provider credentials changed while synchronizing authentication metadata")
+	}
+	headersPath := fmt.Sprintf("providers.%s.extra_headers", providerID)
+	var headers map[string]string
+	if err := json.Unmarshal([]byte(gjson.Get(string(data), headersPath).Raw), &headers); err != nil {
+		return fmt.Errorf("decode provider authentication metadata: %w", err)
+	}
+	if headers[chatgpt.AccountIDHeader] == "" {
+		return errors.New("provider authentication metadata is missing ChatGPT account ID")
+	}
+	merged := maps.Clone(providerConfig.ExtraHeaders)
+	if merged == nil {
+		merged = make(map[string]string)
+	}
+	for _, header := range []string{chatgpt.AccountIDHeader, chatgpt.FedRAMPHeader, chatgpt.OriginatorHeader} {
+		delete(merged, header)
+		if value := headers[header]; value != "" {
+			merged[header] = value
+		}
+	}
+	providerConfig.ExtraHeaders = merged
 	return nil
 }
 

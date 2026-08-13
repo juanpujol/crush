@@ -4,12 +4,14 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/client"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/oauth/chatgpt"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/spf13/cobra"
 )
@@ -27,17 +29,22 @@ var logoutCmd = &cobra.Command{
 	Long: `Logout Crush from a specified platform, removing stored credentials.
 The platform should be provided as an argument.
 If no argument is given, a list of logged-in platforms will be shown.
-Available platforms are: hyper, copilot.`,
+Available platforms are: hyper, copilot, codex.`,
 	Example: `
 # Sign out from Charm Hyper
 crush logout hyper
 
 # Sign out from GitHub Copilot
 crush logout copilot
+
+# Sign out from ChatGPT Codex
+crush logout codex
   `,
 	ValidArgs: []cobra.Completion{
 		"hyper",
 		"copilot",
+		"codex",
+		"openai-codex",
 		"github",
 		"github-copilot",
 	},
@@ -84,10 +91,39 @@ crush logout copilot
 			return logoutHyper(c, ws.ID)
 		case "copilot", "github", "github-copilot":
 			return logoutCopilot(c, ws.ID)
+		case "codex", chatgpt.ProviderID:
+			return logoutCodex(c, ws.ID)
 		default:
 			return fmt.Errorf("unknown platform: %s", provider)
 		}
 	},
+}
+
+type configFieldRemover interface {
+	RemoveConfigField(ctx context.Context, id string, scope config.Scope, key string) error
+}
+
+func logoutCodex(c configFieldRemover, wsID string) error {
+	ctx := getLogoutContext()
+	if client, ok := c.(*client.Client); ok {
+		if cfg, err := client.GetConfig(ctx, wsID); err == nil {
+			if provider, exists := cfg.Providers.Get(chatgpt.ProviderID); exists {
+				if err := chatgpt.NewClient().Revoke(ctx, provider.OAuthToken); err != nil {
+					slog.Warn("Failed to revoke OpenAI Codex credentials", "error", err)
+				}
+			}
+		}
+	}
+	return logoutCodexWithContext(ctx, c, wsID)
+}
+
+func logoutCodexWithContext(ctx context.Context, c configFieldRemover, wsID string) error {
+	if err := c.RemoveConfigField(ctx, wsID, config.ScopeGlobal, "providers."+chatgpt.ProviderID); err != nil {
+		return err
+	}
+
+	fmt.Println(logoutHeaderStyle.Render("Successfully logged out of ChatGPT Codex."))
+	return nil
 }
 
 func logoutHyper(c *client.Client, wsID string) error {
@@ -134,8 +170,9 @@ func pickLoggedInProvider(c *client.Client, wsID string) (string, error) {
 	// Only OAuth-based providers support login/logout. Keep this list in sync
 	// with the switch in RunE and the login command.
 	oauthProviders := map[string]string{
-		"hyper":   "Hyper",
-		"copilot": "GitHub Copilot",
+		"hyper":            "Hyper",
+		"copilot":          "GitHub Copilot",
+		chatgpt.ProviderID: "OpenAI Codex",
 	}
 
 	var loggedIn []loggedInProvider

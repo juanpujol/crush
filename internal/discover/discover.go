@@ -105,6 +105,10 @@ type modelsResponse struct {
 // Models whose IDs already appear in cfg.ExistingModels are skipped —
 // user-specified models take precedence.
 func DiscoverModels(ctx context.Context, cfg Config, resolver Resolver) ([]catwalk.Model, error) {
+	if isCodexProvider(cfg) {
+		return discoverCodexModels(ctx, cfg, resolver)
+	}
+
 	resp, err := doRequest(ctx, http.MethodGet, cfg.BaseURL, "/models", cfg.APIKey, cfg.ExtraHeaders, resolver, nil)
 	if err != nil {
 		return nil, fmt.Errorf("discover models for provider %s: %w", cfg.ID, err)

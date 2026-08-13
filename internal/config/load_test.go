@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/env"
 	"github.com/charmbracelet/crush/internal/oauth"
+	"github.com/charmbracelet/crush/internal/oauth/chatgpt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1013,6 +1014,79 @@ func TestConfig_configureProvidersCustomProviderValidation(t *testing.T) {
 
 		// Discovered model is appended.
 		require.Equal(t, "discovered-model", p.Models[1].ID)
+	})
+
+	t.Run("Codex discovery removes bootstrap and preserves configured models", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, "/models", r.URL.Path)
+			_, _ = w.Write([]byte(`{"models":[{"slug":"discovered-model","display_name":"Discovered","visibility":"list"}]}`))
+		}))
+		defer server.Close()
+
+		discoverTrue := true
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				chatgpt.ProviderID: {
+					ID:                 chatgpt.ProviderID,
+					APIKey:             "access-token",
+					BaseURL:            server.URL,
+					AutoDiscoverModels: &discoverTrue,
+					Models: []catwalk.Model{
+						{ID: "custom-model", Name: "Custom", ContextWindow: 12345},
+					},
+				},
+			}),
+		}
+		cfg.setDefaults("/tmp", "")
+
+		testEnv := env.NewFromMap(map[string]string{})
+		resolver := NewShellVariableResolver(testEnv)
+		err := cfg.configureProviders(context.Background(), testStore(cfg), testEnv, resolver, []catwalk.Provider{CodexProvider()})
+		require.NoError(t, err)
+
+		provider, exists := cfg.Providers.Get(chatgpt.ProviderID)
+		require.True(t, exists)
+		require.Len(t, provider.Models, 2)
+		require.Equal(t, "custom-model", provider.Models[0].ID)
+		require.Equal(t, int64(12345), provider.Models[0].ContextWindow)
+		require.Equal(t, "discovered-model", provider.Models[1].ID)
+	})
+
+	t.Run("Codex discovery preserves explicitly configured bootstrap model", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"models":[{"slug":"discovered-model","display_name":"Discovered","visibility":"list"}]}`))
+		}))
+		defer server.Close()
+
+		discoverTrue := true
+		explicit := CodexProvider().Models[0]
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				chatgpt.ProviderID: {
+					APIKey:             "access-token",
+					BaseURL:            server.URL,
+					AutoDiscoverModels: &discoverTrue,
+					Models:             []catwalk.Model{explicit},
+				},
+			}),
+		}
+		cfg.setDefaults("/tmp", "")
+		testEnv := env.NewFromMap(map[string]string{})
+		err := cfg.configureProviders(
+			context.Background(),
+			testStore(cfg),
+			testEnv,
+			NewShellVariableResolver(testEnv),
+			[]catwalk.Provider{CodexProvider()},
+		)
+		require.NoError(t, err)
+
+		provider, exists := cfg.Providers.Get(chatgpt.ProviderID)
+		require.True(t, exists)
+		require.Len(t, provider.Models, 2)
+		require.Equal(t, explicit, provider.Models[0])
+		require.Equal(t, "discovered-model", provider.Models[1].ID)
+		require.Equal(t, "Discovered", provider.Models[1].Name)
 	})
 
 	t.Run("custom provider with models and no discover_models uses only listed models", func(t *testing.T) {

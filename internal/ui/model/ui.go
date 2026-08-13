@@ -41,6 +41,7 @@ import (
 	"github.com/charmbracelet/crush/internal/home"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/oauth/chatgpt"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/question"
@@ -2354,6 +2355,20 @@ func (m *UI) openAuthenticationDialog(provider catwalk.Provider, model config.Se
 		dlg, cmd = dialog.NewOAuthHyper(m.com, isOnboarding, provider, model, modelType)
 	case catwalk.InferenceProviderCopilot:
 		dlg, cmd = dialog.NewOAuthCopilot(m.com, isOnboarding, provider, model, modelType)
+	case chatgpt.ProviderID:
+		cfg := m.com.Config()
+		expectedAccountID := ""
+		if providerCfg, ok := cfg.Providers.Get(chatgpt.ProviderID); ok {
+			expectedAccountID = providerCfg.ExtraHeaders[chatgpt.AccountIDHeader]
+		}
+		dlg, cmd = dialog.NewOAuthCodex(
+			m.com,
+			isOnboarding,
+			provider,
+			model,
+			modelType,
+			expectedAccountID,
+		)
 	default:
 		dlg, cmd = dialog.NewAPIKeyInput(m.com, isOnboarding, provider, model, modelType)
 	}

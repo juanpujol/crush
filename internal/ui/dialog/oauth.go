@@ -26,6 +26,14 @@ type OAuthProvider interface {
 	stopPolling() tea.Msg
 }
 
+type oauthCredentialValidator interface {
+	validateCredential() error
+}
+
+type oauthCredentialSaver interface {
+	saveCredential(com *common.Common, provider catwalk.Provider, token *oauth.Token) error
+}
+
 // OAuthState represents the current state of the device flow.
 type OAuthState int
 
@@ -209,6 +217,15 @@ func (m *OAuth) HandleMsg(msg tea.Msg) Action {
 		// screen; the actual model selection happens when the user
 		// acknowledges it (fast, since the work is already done).
 		m.State = OAuthStateSuccess
+		if provider, ok := m.com.Config().Providers.Get(string(m.provider.ID)); ok {
+			m.provider = provider.ToProvider()
+			if m.com.Config().GetModel(provider.ID, m.model.Model) == nil && len(provider.Models) > 0 {
+				model := provider.Models[0]
+				m.model.Model = model.ID
+				m.model.MaxTokens = model.DefaultMaxTokens
+				m.model.ReasoningEffort = model.DefaultReasoningEffort
+			}
+		}
 		return nil
 
 	case oauthSaveErrMsg:
@@ -456,6 +473,17 @@ func (m *OAuth) saveCredential() tea.Cmd {
 		token    = m.token
 	)
 	return func() tea.Msg {
+		if validator, ok := m.oAuthProvider.(oauthCredentialValidator); ok {
+			if err := validator.validateCredential(); err != nil {
+				return oauthSaveErrMsg{err: err}
+			}
+		}
+		if saver, ok := m.oAuthProvider.(oauthCredentialSaver); ok {
+			if err := saver.saveCredential(com, provider, token); err != nil {
+				return oauthSaveErrMsg{err: fmt.Errorf("failed to save credentials: %w", err)}
+			}
+			return oauthSaveDoneMsg{}
+		}
 		if err := com.Workspace.SetProviderAPIKey(config.ScopeGlobal, string(provider.ID), token); err != nil {
 			return oauthSaveErrMsg{err: fmt.Errorf("failed to save API key: %w", err)}
 		}
