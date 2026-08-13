@@ -666,6 +666,7 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 			slog.Warn("Failed to refetch Hyper provider after auth", "error", refetchErr)
 		}
 	}
+	s.SignalAuthComplete(providerID)
 	return nil
 }
 

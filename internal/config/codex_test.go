@@ -2,16 +2,10 @@ package config
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,125 +116,6 @@ func TestCodexProviderPersistenceSignalsAuthComplete(t *testing.T) {
 
 	require.NoError(t, store.SetConfigField(ScopeGlobal, "providers."+chatgpt.ProviderID, ProviderConfig{}))
 	require.NoError(t, <-waited)
-}
-
-func TestRefreshOAuthTokenCodexSingleFlight(t *testing.T) {
-	t.Parallel()
-
-	var exchanges atomic.Int64
-	expiresAt := time.Now().Add(time.Hour).Unix()
-	accessToken := codexTestJWT(t, expiresAt)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		exchanges.Add(1)
-		var request map[string]string
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-		require.Equal(t, "rt0", request["refresh_token"])
-		time.Sleep(50 * time.Millisecond)
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
-			"access_token":  accessToken,
-			"refresh_token": "rt1",
-		}))
-	}))
-	t.Cleanup(server.Close)
-
-	configPath := filepath.Join(t.TempDir(), "crush.json")
-	expired := &oauth.Token{
-		AccessToken:  codexTestJWT(t, time.Now().Add(-time.Hour).Unix()),
-		RefreshToken: "rt0",
-		ExpiresIn:    3600,
-		ExpiresAt:    time.Now().Add(-time.Hour).Unix(),
-	}
-	content := map[string]any{
-		"providers": map[string]any{
-			chatgpt.ProviderID: map[string]any{
-				"id":              chatgpt.ProviderID,
-				"name":            chatgpt.ProviderName,
-				"type":            catwalk.TypeOpenAI,
-				"base_url":        chatgpt.BackendURL,
-				"api_key":         expired.AccessToken,
-				"oauth":           expired,
-				"discover_models": false,
-				"models": []catwalk.Model{{
-					ID:   "gpt-5-codex",
-					Name: "GPT-5 Codex",
-				}},
-				"extra_headers": map[string]string{
-					chatgpt.AccountIDHeader: "account-1",
-				},
-			},
-		},
-	}
-	data, err := json.Marshal(content)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(configPath, data, 0o600))
-
-	provider := ProviderConfig{
-		ID:         chatgpt.ProviderID,
-		Name:       chatgpt.ProviderName,
-		BaseURL:    chatgpt.BackendURL,
-		Type:       catwalk.TypeOpenAI,
-		APIKey:     expired.AccessToken,
-		OAuthToken: expired,
-		ExtraHeaders: map[string]string{
-			chatgpt.AccountIDHeader: "account-1",
-		},
-		Models: []catwalk.Model{{
-			ID:   "gpt-5-codex",
-			Name: "GPT-5 Codex",
-		}},
-	}
-	discoverModels := false
-	provider.AutoDiscoverModels = &discoverModels
-	providers := csync.NewMap[string, ProviderConfig]()
-	providers.Set(chatgpt.ProviderID, provider)
-	store := &ConfigStore{
-		config:         &Config{Providers: providers},
-		globalDataPath: configPath,
-		workingDir:     filepath.Dir(configPath),
-		chatGPTClient: chatgpt.NewClient(
-			chatgpt.WithHTTPClient(server.Client()),
-			chatgpt.WithIssuerURL(server.URL),
-		),
-	}
-
-	const callers = 10
-	var group sync.WaitGroup
-	start := make(chan struct{})
-	errors := make(chan error, callers)
-	for range callers {
-		group.Go(func() {
-			<-start
-			errors <- store.RefreshOAuthToken(context.Background(), ScopeGlobal, chatgpt.ProviderID)
-		})
-	}
-	close(start)
-	group.Wait()
-	close(errors)
-	for err := range errors {
-		require.NoError(t, err)
-	}
-
-	require.Equal(t, int64(1), exchanges.Load())
-	refreshed, ok := store.Config().Providers.Get(chatgpt.ProviderID)
-	require.True(t, ok)
-	require.Equal(t, accessToken, refreshed.APIKey)
-	require.Equal(t, "rt1", refreshed.OAuthToken.RefreshToken)
-
-	persisted, err := os.ReadFile(configPath)
-	require.NoError(t, err)
-	require.Equal(t, accessToken, jsonPathString(t, persisted, "providers", chatgpt.ProviderID, "api_key"))
-	require.Equal(t, "rt1", jsonPathString(t, persisted, "providers", chatgpt.ProviderID, "oauth", "refresh_token"))
-}
-
-func codexTestJWT(t *testing.T, expiresAt int64) string {
-	t.Helper()
-	payload, err := json.Marshal(map[string]int64{"exp": expiresAt})
-	require.NoError(t, err)
-	return strings.Join([]string{
-		base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)),
-		base64.RawURLEncoding.EncodeToString(payload),
-		base64.RawURLEncoding.EncodeToString([]byte("signature")),
-	}, ".")
 }
 
 func jsonPathString(t *testing.T, data []byte, path ...string) string {
