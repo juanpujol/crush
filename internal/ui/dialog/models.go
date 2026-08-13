@@ -12,6 +12,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/oauth/chatgpt"
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/charmbracelet/crush/internal/ui/util"
 	uv "github.com/charmbracelet/ultraviolet"
@@ -416,23 +417,27 @@ func (m *Models) setProviderItems() error {
 		displayProvider := provider
 		if providerConfigured {
 			displayProvider.Name = cmp.Or(providerConfig.Name, displayProvider.Name)
-			modelIndex := make(map[string]int, len(displayProvider.Models))
-			for i, model := range displayProvider.Models {
-				modelIndex[model.ID] = i
-			}
-			for _, model := range providerConfig.Models {
-				if model.ID == "" {
-					continue
+			if providerID == chatgpt.ProviderID {
+				displayProvider.Models = slices.Clone(providerConfig.Models)
+			} else {
+				modelIndex := make(map[string]int, len(displayProvider.Models))
+				for i, model := range displayProvider.Models {
+					modelIndex[model.ID] = i
 				}
-				if idx, ok := modelIndex[model.ID]; ok {
-					if model.Name != "" {
-						displayProvider.Models[idx].Name = model.Name
+				for _, model := range providerConfig.Models {
+					if model.ID == "" {
+						continue
 					}
-					continue
+					if idx, ok := modelIndex[model.ID]; ok {
+						if model.Name != "" {
+							displayProvider.Models[idx].Name = model.Name
+						}
+						continue
+					}
+					model.Name = cmp.Or(model.Name, model.ID)
+					displayProvider.Models = append(displayProvider.Models, model)
+					modelIndex[model.ID] = len(displayProvider.Models) - 1
 				}
-				model.Name = cmp.Or(model.Name, model.ID)
-				displayProvider.Models = append(displayProvider.Models, model)
-				modelIndex[model.ID] = len(displayProvider.Models) - 1
 			}
 		}
 

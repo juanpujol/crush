@@ -3,9 +3,7 @@
 name: goreleaser
 
 on:
-  push:
-    tags:
-      - v*.*.*
+  workflow_dispatch:
 
 concurrency:
   group: goreleaser

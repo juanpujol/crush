@@ -1,0 +1,95 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: main
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/charmbracelet/crush.git
+          git fetch upstream main --tags
+
+      - name: Check for a new release
+        id: updates
+        run: |
+          release=$(git tag --merged upstream/main --sort=-version:refname "v*" | head -n 1)
+          if [ -z "$release" ]; then
+            echo "No upstream release tag found"
+            exit 1
+          fi
+
+          commit=$(git rev-list -n 1 "$release")
+          if git merge-base --is-ancestor "$commit" origin/main; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short "$commit")" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "release_commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Update sync branch
+        if: steps.updates.outputs.available == 'true'
+        env:
+          RELEASE_COMMIT: ${{ steps.updates.outputs.release_commit }}
+        run: git push --force origin "${RELEASE_COMMIT}:refs/heads/sync/upstream-main"
+
+      - name: Open or update pull request
+        if: steps.updates.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          COMMIT: ${{ steps.updates.outputs.commit }}
+          RELEASE: ${{ steps.updates.outputs.release }}
+        run: |
+          body=$(cat <<EOF
+          Sync this fork with the latest upstream stable release.
+
+          - Upstream release: \`${RELEASE}\`
+          - Upstream commit: \`${COMMIT}\`
+          - Review conflicts and wait for all CI checks before merging manually.
+
+          This pull request is maintained automatically by the upstream sync workflow,
+          but it is never merged automatically.
+          EOF
+          )
+
+          number=$(gh pr list \
+            --base main \
+            --head sync/upstream-main \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$number" ]; then
+            gh pr edit "$number" \
+              --add-assignee "${{ github.repository_owner }}" \
+              --title "chore: sync with upstream ${RELEASE}" \
+              --body "$body"
+          else
+            gh pr create \
+              --base main \
+              --head sync/upstream-main \
+              --assignee "${{ github.repository_owner }}" \
+              --title "chore: sync with upstream ${RELEASE}" \
+              --body "$body"
+          fi

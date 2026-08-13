@@ -233,11 +233,18 @@ func Providers(cfg *Config, opts ...HyperTokenRefresher) ([]catwalk.Provider, er
 		})
 
 		wg.Wait()
+		codexProvider := CodexProvider()
+		catalog := slices.Collect(providers.Seq())
+		if !customProvidersOnly && !slices.ContainsFunc(catalog, func(provider catwalk.Provider) bool {
+			return provider.ID == codexProvider.ID
+		}) {
+			catalog = append([]catwalk.Provider{codexProvider}, catalog...)
+		}
 
 		if hyperProvider.ID != "" {
-			providerList = append([]catwalk.Provider{hyperProvider}, slices.Collect(providers.Seq())...)
+			providerList = append([]catwalk.Provider{hyperProvider}, catalog...)
 		} else {
-			providerList = slices.Collect(providers.Seq())
+			providerList = catalog
 		}
 		providerErr = errors.Join(catwalkErr, hyperErr)
 	})

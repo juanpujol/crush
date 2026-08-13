@@ -2,7 +2,9 @@ package config
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -17,6 +19,7 @@ import (
 	"github.com/charmbracelet/crush/internal/env"
 	"github.com/charmbracelet/crush/internal/lock"
 	"github.com/charmbracelet/crush/internal/oauth"
+	"github.com/charmbracelet/crush/internal/oauth/chatgpt"
 	"github.com/charmbracelet/crush/internal/oauth/copilot"
 	"github.com/charmbracelet/crush/internal/oauth/hyper"
 	"github.com/tidwall/gjson"
@@ -37,6 +40,8 @@ const configLockDeadline = 5 * time.Second
 // already-rotated refresh token and trip the provider's reuse detection,
 // revoking the whole token family.
 const refreshLockDeadline = 45 * time.Second
+
+const refreshOperationDeadline = 90 * time.Second
 
 // credentialWriteLockDeadline bounds how long a credential write (e.g.
 // storing the token from a fresh interactive login) waits for the
@@ -119,7 +124,11 @@ type ConfigStore struct {
 	// It is a field so tests can substitute a fake exchange without making
 	// real network calls. Production code leaves it nil, and exchange falls
 	// back to the real provider clients.
-	exchangeToken func(ctx context.Context, providerID, refreshToken string) (*oauth.Token, error)
+	exchangeToken func(ctx context.Context, providerID string, provider ProviderConfig) (*oauth.Token, error)
+
+	// chatGPTClient is injectable so protocol tests can use an httptest
+	// server while still exercising the production exchange dispatch.
+	chatGPTClient *chatgpt.Client
 
 	// authSignalMu guards authSignals, which maps provider IDs to
 	// channels that WaitForTokenChange blocks on. SignalAuthComplete
@@ -356,7 +365,22 @@ func (s *ConfigStore) HasConfigField(scope Scope, key string) bool {
 // After a successful write, it automatically reloads config to keep in-memory
 // state fresh.
 func (s *ConfigStore) SetConfigField(scope Scope, key string, value any) error {
-	return s.SetConfigFields(scope, map[string]any{key: value})
+	write := func() error {
+		return s.SetConfigFields(scope, map[string]any{key: value})
+	}
+	var err error
+	if key == "providers."+chatgpt.ProviderID {
+		err = s.withRefreshLock(chatgpt.ProviderID, write)
+	} else {
+		err = write()
+	}
+	if err != nil {
+		return err
+	}
+	if key == "providers."+chatgpt.ProviderID {
+		s.SignalAuthComplete(chatgpt.ProviderID)
+	}
+	return nil
 }
 
 // SetConfigFields sets multiple key/value pairs in the config file for the
@@ -489,22 +513,33 @@ func (s *ConfigStore) pinPreferredModelLocked(modelType SelectedModelType, model
 //
 // The write is protected by an in-process mutex and a cross-process flock.
 func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
-	err := s.atomicWrite(scope, func(data []byte) ([]byte, error) {
-		v, sErr := sjson.Delete(string(data), key)
-		if sErr != nil {
-			return nil, fmt.Errorf("failed to delete config field %s: %w", key, sErr)
+	remove := func() error {
+		err := s.atomicWrite(scope, func(data []byte) ([]byte, error) {
+			v, sErr := sjson.Delete(string(data), key)
+			if sErr != nil {
+				return nil, fmt.Errorf("failed to delete config field %s: %w", key, sErr)
+			}
+			return []byte(v), nil
+		})
+		if err != nil {
+			return err
 		}
-		return []byte(v), nil
-	})
-	if err != nil {
-		return err
-	}
 
-	if err := s.autoReload(context.Background()); err != nil {
-		slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
+		if err := s.autoReload(context.Background()); err != nil {
+			slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
+		}
+		return nil
 	}
-
-	return nil
+	if key == "providers."+chatgpt.ProviderID {
+		if err := s.withRefreshLock(chatgpt.ProviderID, remove); err != nil {
+			return err
+		}
+		s.mutateInMemory(func(c *Config) {
+			c.Providers.Del(chatgpt.ProviderID)
+		})
+		return nil
+	}
+	return remove()
 }
 
 // UpdatePreferredModel updates the preferred model for the given type and
@@ -634,6 +669,7 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 			slog.Warn("Failed to refetch Hyper provider after auth", "error", refetchErr)
 		}
 	}
+	s.SignalAuthComplete(providerID)
 	return nil
 }
 
@@ -657,10 +693,17 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 //     peer's fresh token on disk and adopts it instead of exchanging.
 func (s *ConfigStore) RefreshOAuthToken(ctx context.Context, scope Scope, providerID string) error {
 	key := fmt.Sprintf("%d\x00%s", scope, providerID)
-	_, err, _ := s.refreshSF.Do(key, func() (any, error) {
-		return nil, s.refreshOAuthTokenLocked(ctx, scope, providerID)
+	result := s.refreshSF.DoChan(key, func() (any, error) {
+		operationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshOperationDeadline)
+		defer cancel()
+		return nil, s.refreshOAuthTokenLocked(operationCtx, scope, providerID)
 	})
-	return err
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case result := <-result:
+		return result.Err
+	}
 }
 
 // refreshOAuthTokenLocked performs the cross-process single-flighted
@@ -684,15 +727,22 @@ func (s *ConfigStore) refreshOAuthTokenLocked(ctx context.Context, scope Scope, 
 	// mid-exchange has time to publish a token we can adopt. Lock ordering:
 	// the refresh lock is always taken before the config-write lock (via
 	// SetConfigFields), never the reverse, so no deadlock is possible.
+	lockPath, err := s.refreshLockPath(providerID)
+	if err != nil {
+		return err
+	}
 	lockCtx, cancel := context.WithTimeout(ctx, refreshLockDeadline)
 	defer cancel()
-	release, lockErr := lock.File(lockCtx, s.refreshLockPath(providerID))
+	release, lockErr := lock.File(lockCtx, lockPath)
 	if lockErr != nil {
 		// Could not acquire the lock (peer wedged or deadline hit). Prefer a
 		// usable token already on disk over forcing our own exchange, which
 		// would risk reusing a rotated refresh token.
 		if diskToken := s.usableDiskToken(scope, providerID, entryToken); diskToken != nil {
 			slog.Warn("Refresh lock unavailable; adopting token from disk", "provider", providerID, "error", lockErr)
+			if err := s.syncDiskAuth(scope, providerID, diskToken, &providerConfig); err != nil {
+				return err
+			}
 			return s.applyToken(providerConfig, diskToken, providerID)
 		}
 		return fmt.Errorf("acquire refresh lock for provider %s: %w", providerID, lockErr)
@@ -708,15 +758,23 @@ func (s *ConfigStore) refreshOAuthTokenLocked(ctx context.Context, scope Scope, 
 	if diskToken := s.newerDiskToken(scope, providerID, entryToken); diskToken != nil {
 		if !diskToken.IsExpired() {
 			slog.Info("Adopting token refreshed by another session", "provider", providerID)
+			if err := s.syncDiskAuth(scope, providerID, diskToken, &providerConfig); err != nil {
+				return err
+			}
 			return s.applyToken(providerConfig, diskToken, providerID)
 		}
 		slog.Info("Exchanging with refresh token rotated by another session", "provider", providerID)
+		if err := s.syncDiskAuth(scope, providerID, diskToken, &providerConfig); err != nil {
+			return err
+		}
 		entryToken = diskToken
+		providerConfig.OAuthToken = diskToken
+		providerConfig.APIKey = diskToken.AccessToken
 	}
 
 	// Disk still holds our token (or no newer peer token exists) and we hold
 	// the lock, so we are the sole exchanger. Perform the exchange.
-	refreshedToken, refreshErr := s.exchange(ctx, providerID, entryToken.RefreshToken)
+	refreshedAuth, refreshErr := s.exchange(ctx, providerID, providerConfig)
 	if refreshErr != nil {
 		// The exchange may have failed because a peer rotated the refresh
 		// token in a window we did not cover. Re-check disk: adopt a usable
@@ -724,28 +782,41 @@ func (s *ConfigStore) refreshOAuthTokenLocked(ctx context.Context, scope Scope, 
 		if diskToken := s.newerDiskToken(scope, providerID, entryToken); diskToken != nil {
 			if !diskToken.IsExpired() {
 				slog.Info("Adopting token refreshed by another session after exchange failure", "provider", providerID)
+				if err := s.syncDiskAuth(scope, providerID, diskToken, &providerConfig); err != nil {
+					return err
+				}
 				return s.applyToken(providerConfig, diskToken, providerID)
 			}
 			slog.Info("Retrying exchange with refresh token rotated by another session", "provider", providerID)
-			refreshedToken, refreshErr = s.exchange(ctx, providerID, diskToken.RefreshToken)
+			if err := s.syncDiskAuth(scope, providerID, diskToken, &providerConfig); err != nil {
+				return err
+			}
+			providerConfig.OAuthToken = diskToken
+			providerConfig.APIKey = diskToken.AccessToken
+			refreshedAuth, refreshErr = s.exchange(ctx, providerID, providerConfig)
 		}
 	}
 	if refreshErr != nil {
 		return fmt.Errorf("failed to refresh OAuth token for provider %s: %w", providerID, refreshErr)
 	}
 
-	slog.Info("Successfully refreshed OAuth token", "provider", providerID)
-	if err := s.applyToken(providerConfig, refreshedToken, providerID); err != nil {
-		return err
+	fields := map[string]any{
+		fmt.Sprintf("providers.%s.api_key", providerID): refreshedAuth.Token.AccessToken,
+		fmt.Sprintf("providers.%s.oauth", providerID):   refreshedAuth.Token,
 	}
-
-	if err := s.SetConfigFields(scope, map[string]any{
-		fmt.Sprintf("providers.%s.api_key", providerID): refreshedToken.AccessToken,
-		fmt.Sprintf("providers.%s.oauth", providerID):   refreshedToken,
-	}); err != nil {
+	if providerID == chatgpt.ProviderID {
+		if !refreshedAuth.HasRoutingMetadata {
+			refreshedAuth.AccountID = providerConfig.ExtraHeaders[chatgpt.AccountIDHeader]
+			refreshedAuth.FedRAMP = providerConfig.ExtraHeaders[chatgpt.FedRAMPHeader] == "true"
+		}
+		providerConfig.ExtraHeaders = codexAuthHeaders(providerConfig.ExtraHeaders, refreshedAuth)
+		fields[fmt.Sprintf("providers.%s.extra_headers", providerID)] = providerConfig.ExtraHeaders
+	}
+	slog.Info("Successfully refreshed OAuth token", "provider", providerID)
+	if err := s.SetConfigFields(scope, fields); err != nil {
 		return fmt.Errorf("failed to persist refreshed token: %w", err)
 	}
-	return nil
+	return s.applyToken(providerConfig, refreshedAuth.Token, providerID)
 }
 
 // WaitForTokenChange blocks until SignalAuthComplete is called for the
@@ -830,7 +901,8 @@ func (s *ConfigStore) newerDiskToken(scope Scope, providerID string, entryToken 
 	if diskToken == nil {
 		return nil
 	}
-	if diskToken.AccessToken == entryToken.AccessToken {
+	if diskToken.AccessToken == entryToken.AccessToken &&
+		diskToken.RefreshToken == entryToken.RefreshToken {
 		// Same token we started with; nobody rotated since.
 		return nil
 	}
@@ -860,17 +932,30 @@ func (s *ConfigStore) usableDiskToken(scope Scope, providerID string, entryToken
 // exchange performs the provider-specific OAuth token exchange. Tests may
 // override it via the exchangeToken field; production uses the real
 // provider clients.
-func (s *ConfigStore) exchange(ctx context.Context, providerID, refreshToken string) (*oauth.Token, error) {
+func (s *ConfigStore) exchange(ctx context.Context, providerID string, provider ProviderConfig) (chatgpt.AuthResult, error) {
 	if s.exchangeToken != nil {
-		return s.exchangeToken(ctx, providerID, refreshToken)
+		token, err := s.exchangeToken(ctx, providerID, provider)
+		return chatgpt.AuthResult{Token: token}, err
 	}
 	switch providerID {
 	case string(catwalk.InferenceProviderCopilot):
-		return copilot.RefreshToken(ctx, refreshToken)
+		token, err := copilot.RefreshToken(ctx, provider.OAuthToken.RefreshToken)
+		return chatgpt.AuthResult{Token: token}, err
 	case hyperp.Name:
-		return hyper.ExchangeToken(ctx, refreshToken)
+		token, err := hyper.ExchangeToken(ctx, provider.OAuthToken.RefreshToken)
+		return chatgpt.AuthResult{Token: token}, err
+	case chatgpt.ProviderID:
+		client := s.chatGPTClient
+		if client == nil {
+			client = chatgpt.NewClient()
+		}
+		return client.Refresh(
+			ctx,
+			provider.OAuthToken,
+			provider.ExtraHeaders[chatgpt.AccountIDHeader],
+		)
 	default:
-		return nil, fmt.Errorf("OAuth refresh not supported for provider %s", providerID)
+		return chatgpt.AuthResult{}, fmt.Errorf("OAuth refresh not supported for provider %s", providerID)
 	}
 }
 
@@ -880,12 +965,15 @@ func (s *ConfigStore) exchange(ctx context.Context, providerID, refreshToken str
 // taken in time, fn runs anyway rather than blocking a write the user is
 // waiting on.
 func (s *ConfigStore) withRefreshLock(providerID string, fn func() error) error {
+	lockPath, err := s.refreshLockPath(providerID)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), credentialWriteLockDeadline)
 	defer cancel()
-	release, err := lock.File(ctx, s.refreshLockPath(providerID))
+	release, err := lock.File(ctx, lockPath)
 	if err != nil {
-		slog.Warn("Writing credentials without the refresh lock", "provider", providerID, "error", err)
-		return fn()
+		return fmt.Errorf("acquire credential write lock for provider %s: %w", providerID, err)
 	}
 	defer release()
 	return fn()
@@ -896,10 +984,13 @@ func (s *ConfigStore) withRefreshLock(providerID string, fn func() error) error 
 // data dir so they do not clutter the config directory. The file is created
 // on demand by lock.File and is never removed (flock keys on inode, not
 // path).
-func (s *ConfigStore) refreshLockPath(providerID string) string {
+func (s *ConfigStore) refreshLockPath(providerID string) (string, error) {
 	dir := filepath.Join(filepath.Dir(s.globalDataPath), "locks")
-	_ = os.MkdirAll(dir, 0o755)
-	return filepath.Join(dir, fmt.Sprintf("%s.refresh.lock", providerID))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create refresh lock directory: %w", err)
+	}
+	digest := sha256.Sum256([]byte(providerID))
+	return filepath.Join(dir, fmt.Sprintf("%x.refresh.lock", digest)), nil
 }
 
 // applyToken updates the in-memory provider config with the given token.
@@ -909,7 +1000,65 @@ func (s *ConfigStore) applyToken(providerConfig ProviderConfig, token *oauth.Tok
 	if providerID == string(catwalk.InferenceProviderCopilot) {
 		providerConfig.SetupGitHubCopilot()
 	}
-	s.Config().Providers.Set(providerID, providerConfig)
+	s.mutateInMemory(func(c *Config) {
+		c.Providers.Set(providerID, providerConfig)
+	})
+	return nil
+}
+
+func codexAuthHeaders(current map[string]string, auth chatgpt.AuthResult) map[string]string {
+	headers := maps.Clone(current)
+	if headers == nil {
+		headers = make(map[string]string)
+	}
+	headers[chatgpt.AccountIDHeader] = auth.AccountID
+	headers[chatgpt.OriginatorHeader] = chatgpt.Originator
+	delete(headers, chatgpt.FedRAMPHeader)
+	if auth.FedRAMP {
+		headers[chatgpt.FedRAMPHeader] = "true"
+	}
+	return headers
+}
+
+func (s *ConfigStore) syncDiskAuth(scope Scope, providerID string, expected *oauth.Token, providerConfig *ProviderConfig) error {
+	if providerID != chatgpt.ProviderID {
+		return nil
+	}
+	path, err := s.configPath(scope)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read provider authentication metadata: %w", err)
+	}
+	oauthPath := fmt.Sprintf("providers.%s.oauth", providerID)
+	var token oauth.Token
+	if err := json.Unmarshal([]byte(gjson.Get(string(data), oauthPath).Raw), &token); err != nil {
+		return fmt.Errorf("decode provider token metadata: %w", err)
+	}
+	if token.AccessToken != expected.AccessToken || token.RefreshToken != expected.RefreshToken {
+		return errors.New("provider credentials changed while synchronizing authentication metadata")
+	}
+	headersPath := fmt.Sprintf("providers.%s.extra_headers", providerID)
+	var headers map[string]string
+	if err := json.Unmarshal([]byte(gjson.Get(string(data), headersPath).Raw), &headers); err != nil {
+		return fmt.Errorf("decode provider authentication metadata: %w", err)
+	}
+	if headers[chatgpt.AccountIDHeader] == "" {
+		return errors.New("provider authentication metadata is missing ChatGPT account ID")
+	}
+	merged := maps.Clone(providerConfig.ExtraHeaders)
+	if merged == nil {
+		merged = make(map[string]string)
+	}
+	for _, header := range []string{chatgpt.AccountIDHeader, chatgpt.FedRAMPHeader, chatgpt.OriginatorHeader} {
+		delete(merged, header)
+		if value := headers[header]; value != "" {
+			merged[header] = value
+		}
+	}
+	providerConfig.ExtraHeaders = merged
 	return nil
 }
 
