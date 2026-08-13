@@ -510,22 +510,33 @@ func (s *ConfigStore) pinPreferredModelLocked(modelType SelectedModelType, model
 //
 // The write is protected by an in-process mutex and a cross-process flock.
 func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
-	err := s.atomicWrite(scope, func(data []byte) ([]byte, error) {
-		v, sErr := sjson.Delete(string(data), key)
-		if sErr != nil {
-			return nil, fmt.Errorf("failed to delete config field %s: %w", key, sErr)
+	remove := func() error {
+		err := s.atomicWrite(scope, func(data []byte) ([]byte, error) {
+			v, sErr := sjson.Delete(string(data), key)
+			if sErr != nil {
+				return nil, fmt.Errorf("failed to delete config field %s: %w", key, sErr)
+			}
+			return []byte(v), nil
+		})
+		if err != nil {
+			return err
 		}
-		return []byte(v), nil
-	})
-	if err != nil {
-		return err
-	}
 
-	if err := s.autoReload(context.Background()); err != nil {
-		slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
+		if err := s.autoReload(context.Background()); err != nil {
+			slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
+		}
+		return nil
 	}
-
-	return nil
+	if key == "providers."+chatgpt.ProviderID {
+		if err := s.withRefreshLock(chatgpt.ProviderID, remove); err != nil {
+			return err
+		}
+		s.mutateInMemory(func(c *Config) {
+			c.Providers.Del(chatgpt.ProviderID)
+		})
+		return nil
+	}
+	return remove()
 }
 
 // UpdatePreferredModel updates the preferred model for the given type and
@@ -775,17 +786,13 @@ func (s *ConfigStore) refreshOAuthTokenLocked(ctx context.Context, scope Scope, 
 	}
 
 	slog.Info("Successfully refreshed OAuth token", "provider", providerID)
-	if err := s.applyToken(providerConfig, refreshedToken, providerID); err != nil {
-		return err
-	}
-
 	if err := s.SetConfigFields(scope, map[string]any{
 		fmt.Sprintf("providers.%s.api_key", providerID): refreshedToken.AccessToken,
 		fmt.Sprintf("providers.%s.oauth", providerID):   refreshedToken,
 	}); err != nil {
 		return fmt.Errorf("failed to persist refreshed token: %w", err)
 	}
-	return nil
+	return s.applyToken(providerConfig, refreshedToken, providerID)
 }
 
 // WaitForTokenChange blocks until SignalAuthComplete is called for the
@@ -870,7 +877,8 @@ func (s *ConfigStore) newerDiskToken(scope Scope, providerID string, entryToken 
 	if diskToken == nil {
 		return nil
 	}
-	if diskToken.AccessToken == entryToken.AccessToken {
+	if diskToken.AccessToken == entryToken.AccessToken &&
+		diskToken.RefreshToken == entryToken.RefreshToken {
 		// Same token we started with; nobody rotated since.
 		return nil
 	}
@@ -938,8 +946,7 @@ func (s *ConfigStore) withRefreshLock(providerID string, fn func() error) error 
 	defer cancel()
 	release, err := lock.File(ctx, s.refreshLockPath(providerID))
 	if err != nil {
-		slog.Warn("Writing credentials without the refresh lock", "provider", providerID, "error", err)
-		return fn()
+		return fmt.Errorf("acquire credential write lock for provider %s: %w", providerID, err)
 	}
 	defer release()
 	return fn()

@@ -1089,6 +1089,66 @@ func TestConfig_configureProvidersCustomProviderValidation(t *testing.T) {
 		require.Equal(t, "Discovered", provider.Models[1].Name)
 	})
 
+	t.Run("Codex credentials cannot be redirected by workspace config", func(t *testing.T) {
+		var authorization string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authorization = r.Header.Get("Authorization")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		}))
+		defer server.Close()
+
+		global := []byte(`{"providers":{"openai-codex":{"api_key":"global-secret","oauth":{"access_token":"global-secret","refresh_token":"refresh-token"},"discover_models":true}}}`)
+		workspace := []byte(`{"providers":{"openai-codex":{"base_url":"` + server.URL + `"}}}`)
+		cfg, err := loadFromBytes([][]byte{global, workspace})
+		require.NoError(t, err)
+		cfg.setDefaults(t.TempDir(), "")
+		testEnv := env.NewFromMap(map[string]string{})
+
+		require.NoError(t, cfg.configureProviders(
+			context.Background(),
+			testStore(cfg),
+			testEnv,
+			NewShellVariableResolver(testEnv),
+			[]catwalk.Provider{CodexProvider()},
+		))
+		require.Empty(t, authorization)
+	})
+
+	t.Run("Codex discovery authentication failure preserves selected model", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		}))
+		defer server.Close()
+
+		discoverTrue := true
+		cfg := &Config{
+			Models: map[SelectedModelType]SelectedModel{
+				SelectedModelTypeLarge: {Provider: chatgpt.ProviderID, Model: "account-model"},
+			},
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				chatgpt.ProviderID: {
+					APIKey:             "expired-access-token",
+					BaseURL:            server.URL,
+					AutoDiscoverModels: &discoverTrue,
+				},
+			}),
+		}
+		cfg.setDefaults(t.TempDir(), "")
+		testEnv := env.NewFromMap(map[string]string{})
+
+		require.NoError(t, cfg.configureProviders(
+			context.Background(),
+			testStore(cfg),
+			testEnv,
+			NewShellVariableResolver(testEnv),
+			[]catwalk.Provider{CodexProvider()},
+		))
+		resolved, err := resolveSelectedModels(cfg, []catwalk.Provider{CodexProvider()})
+		require.NoError(t, err)
+		require.False(t, resolved.LargeFallback)
+		require.Equal(t, "account-model", resolved.Large.Model)
+	})
+
 	t.Run("custom provider with models and no discover_models uses only listed models", func(t *testing.T) {
 		cfg := &Config{
 			Providers: csync.NewMapFrom(map[string]ProviderConfig{

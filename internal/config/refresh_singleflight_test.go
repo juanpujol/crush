@@ -396,3 +396,114 @@ func TestRefreshOAuthToken_IgnoresOlderDiskToken(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "rt1", pc.OAuthToken.RefreshToken)
 }
+
+func TestRefreshOAuthToken_AdoptsRefreshTokenOnlyRotation(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "crush.json")
+	exchange, exchanges, reuse := rotatingExchange("rt1", 2)
+	store := newRefreshTestStore(t, configPath, "hyper", exchange)
+
+	writeTokenToDisk(t, configPath, &oauth.Token{
+		AccessToken:  "at0",
+		RefreshToken: "rt1",
+		ExpiresIn:    3600,
+		ExpiresAt:    time.Now().Add(-time.Minute).Unix(),
+	})
+
+	require.NoError(t, store.RefreshOAuthToken(context.Background(), ScopeGlobal, "hyper"))
+	require.Equal(t, int64(1), exchanges.Load())
+	require.Equal(t, int64(0), reuse.Load())
+
+	provider, ok := store.Config().Providers.Get("hyper")
+	require.True(t, ok)
+	require.Equal(t, "at2", provider.OAuthToken.AccessToken)
+	require.Equal(t, "rt2", provider.OAuthToken.RefreshToken)
+}
+
+func TestRefreshOAuthToken_DoesNotPublishUnpersistedToken(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "crush.json")
+	store := newRefreshTestStore(t, configPath, "hyper", func(context.Context, string, ProviderConfig) (*oauth.Token, error) {
+		return &oauth.Token{
+			AccessToken:  "at1",
+			RefreshToken: "rt1",
+			ExpiresIn:    3600,
+			ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+		}, nil
+	})
+	store.globalDataPath = t.TempDir()
+
+	require.ErrorContains(t, store.RefreshOAuthToken(context.Background(), ScopeGlobal, "hyper"), "persist refreshed token")
+
+	provider, ok := store.Config().Providers.Get("hyper")
+	require.True(t, ok)
+	require.Equal(t, "at0", provider.OAuthToken.AccessToken)
+	require.Equal(t, "rt0", provider.OAuthToken.RefreshToken)
+}
+
+func TestRefreshOAuthToken_LogoutDoesNotRestoreCredentials(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "crush.json")
+	exchangeStarted := make(chan struct{})
+	releaseExchange := make(chan struct{})
+	store := newRefreshTestStore(t, configPath, chatgpt.ProviderID, func(context.Context, string, ProviderConfig) (*oauth.Token, error) {
+		close(exchangeStarted)
+		<-releaseExchange
+		return &oauth.Token{
+			AccessToken:  "at1",
+			RefreshToken: "rt1",
+			ExpiresIn:    3600,
+			ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+		}, nil
+	})
+
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- store.RefreshOAuthToken(context.Background(), ScopeGlobal, chatgpt.ProviderID)
+	}()
+	<-exchangeStarted
+
+	logoutDone := make(chan error, 1)
+	go func() {
+		logoutDone <- store.RemoveConfigField(ScopeGlobal, "providers."+chatgpt.ProviderID)
+	}()
+	var (
+		logoutErr       error
+		logoutCompleted bool
+	)
+	select {
+	case logoutErr = <-logoutDone:
+		logoutCompleted = true
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseExchange)
+	require.NoError(t, <-refreshDone)
+	if !logoutCompleted {
+		logoutErr = <-logoutDone
+	}
+	require.NoError(t, logoutErr)
+
+	require.False(t, store.HasConfigField(ScopeGlobal, "providers."+chatgpt.ProviderID))
+	_, exists := store.Config().Providers.Get(chatgpt.ProviderID)
+	require.False(t, exists)
+}
+
+func TestWithRefreshLock_DoesNotWriteWithoutLock(t *testing.T) {
+	t.Parallel()
+
+	parent := t.TempDir()
+	blocked := filepath.Join(parent, "blocked")
+	require.NoError(t, os.WriteFile(blocked, []byte("not a directory"), 0o600))
+	store := &ConfigStore{globalDataPath: filepath.Join(blocked, "crush.json")}
+	wrote := false
+
+	require.Error(t, store.withRefreshLock(chatgpt.ProviderID, func() error {
+		wrote = true
+		return nil
+	}))
+	require.False(t, wrote)
+}

@@ -236,7 +236,7 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 		}
 		// if the user configured a known provider we need to allow it to override a couple of parameters
 		if configExists {
-			if config.BaseURL != "" {
+			if config.BaseURL != "" && (p.ID != catwalk.InferenceProvider(chatgpt.ProviderID) || config.OAuthToken == nil) {
 				p.APIEndpoint = config.BaseURL
 			}
 			if config.APIKey != "" {
@@ -482,6 +482,19 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 		if result, ok := discoveryResults[id]; ok {
 			if result.err != nil {
 				slog.Warn("Model discovery failed", "provider", id, "error", result.err)
+				if id == chatgpt.ProviderID {
+					for _, selected := range c.Models {
+						if selected.Provider == id && selected.Model != "" &&
+							!slices.ContainsFunc(providerConfig.Models, func(model catwalk.Model) bool {
+								return model.ID == selected.Model
+							}) {
+							providerConfig.Models = append(providerConfig.Models, catwalk.Model{
+								ID:   selected.Model,
+								Name: selected.Model,
+							})
+						}
+					}
+				}
 				if len(providerConfig.Models) == 0 {
 					slog.Warn("Skipping provider with no models after failed discovery", "provider", id)
 					c.Providers.Del(id)
