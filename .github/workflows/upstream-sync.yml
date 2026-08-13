@@ -66,9 +66,10 @@ jobs:
 
           - Upstream release: \`${RELEASE}\`
           - Upstream commit: \`${COMMIT}\`
-          - Review conflicts and wait for all CI checks before merging.
+          - Review conflicts and wait for all CI checks before merging manually.
 
-          This pull request is maintained automatically by the upstream sync workflow.
+          This pull request is maintained automatically by the upstream sync workflow,
+          but it is never merged automatically.
           EOF
           )
 
@@ -91,12 +92,4 @@ jobs:
               --assignee "${{ github.repository_owner }}" \
               --title "chore: sync with upstream ${RELEASE}" \
               --body "$body"
-            number=$(gh pr list \
-              --base main \
-              --head sync/upstream-main \
-              --state open \
-              --json number \
-              --jq '.[0].number')
           fi
-
-          gh pr merge "$number" --auto --merge

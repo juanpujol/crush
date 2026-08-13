@@ -5,7 +5,7 @@
 >
 > This fork is maintained as source code and does not publish binary builds. To use its Codex support, clone this repository, run `go build .`, and launch the resulting `./crush` binary. Upstream installation commands below install the official version and do not include this fork's Codex subscription support.
 >
-> A weekly automation checks for new stable upstream release tags and opens an update pull request when one is available. Updates are merged only after the fork's required checks pass; conflicts require manual resolution. This fork may therefore trail the official project between releases.
+> A weekly automation checks for new stable upstream release tags and opens an update pull request when one is available. Updates are reviewed and merged manually after the fork's required checks pass; conflicts require manual resolution. This fork may therefore trail the official project between releases.
 
 <p align="center">
     <a href="https://stuff.charm.sh/crush/charm-crush.png"><img width="450" alt="Charm Crush Logo" src="https://github.com/user-attachments/assets/cf8ca3ce-8b02-43f0-9d0f-5a331488da4b" /></a><br />

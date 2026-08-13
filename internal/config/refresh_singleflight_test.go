@@ -2,10 +2,14 @@ package config
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -111,6 +115,30 @@ func writeCodexAuthToDisk(t *testing.T, path string, token *oauth.Token, account
 	require.NoError(t, os.WriteFile(path, configContent, 0o600))
 }
 
+func codexRefreshJWT(t *testing.T, accountID string, fedRAMP bool) string {
+	t.Helper()
+	claims := map[string]any{"exp": time.Now().Add(time.Hour).Unix()}
+	if accountID != "" {
+		claims["https://api.openai.com/auth"] = map[string]any{
+			"chatgpt_account_id":         accountID,
+			"chatgpt_account_is_fedramp": fedRAMP,
+		}
+	}
+	payload, err := json.Marshal(claims)
+	require.NoError(t, err)
+	return strings.Join([]string{
+		base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)),
+		base64.RawURLEncoding.EncodeToString(payload),
+		base64.RawURLEncoding.EncodeToString([]byte("signature")),
+	}, ".")
+}
+
+func writeRefreshJSON(t *testing.T, w http.ResponseWriter, value any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	require.NoError(t, json.NewEncoder(w).Encode(value))
+}
+
 // TestRefreshOAuthToken_InProcessSingleFlight verifies that a storm of
 // concurrent refresh calls for the same provider collapses into a single
 // token exchange.
@@ -154,6 +182,44 @@ func TestRefreshOAuthToken_InProcessSingleFlight(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "at1", pc.OAuthToken.AccessToken)
 	require.Equal(t, "rt1", pc.OAuthToken.RefreshToken)
+}
+
+func TestRefreshOAuthToken_CanceledCallerDoesNotCancelSharedRefresh(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "crush.json")
+	exchangeStarted := make(chan struct{})
+	releaseExchange := make(chan struct{})
+	store := newRefreshTestStore(t, configPath, "hyper", func(context.Context, string, ProviderConfig) (*oauth.Token, error) {
+		close(exchangeStarted)
+		<-releaseExchange
+		return &oauth.Token{
+			AccessToken:  "at1",
+			RefreshToken: "rt1",
+			ExpiresIn:    3600,
+			ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+		}, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	canceled := make(chan error, 1)
+	go func() {
+		canceled <- store.RefreshOAuthToken(ctx, ScopeGlobal, "hyper")
+	}()
+	<-exchangeStarted
+
+	joined := make(chan error, 1)
+	go func() {
+		joined <- store.RefreshOAuthToken(context.Background(), ScopeGlobal, "hyper")
+	}()
+	cancel()
+	require.ErrorIs(t, <-canceled, context.Canceled)
+	close(releaseExchange)
+	require.NoError(t, <-joined)
+
+	provider, ok := store.Config().Providers.Get("hyper")
+	require.True(t, ok)
+	require.Equal(t, "rt1", provider.OAuthToken.RefreshToken)
 }
 
 // TestRefreshOAuthToken_CrossProcessAdopt verifies that when two instances
@@ -317,6 +383,50 @@ func TestRefreshOAuthToken_AdoptsFresherDiskToken(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "at9", pc.OAuthToken.AccessToken)
 	require.Equal(t, "at9", pc.APIKey)
+}
+
+func TestRefreshOAuthToken_PersistsCodexAccountMetadata(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "crush.json")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRefreshJSON(t, w, map[string]any{
+			"id_token":      codexRefreshJWT(t, "account-1", false),
+			"access_token":  codexRefreshJWT(t, "", false),
+			"refresh_token": "rt1",
+			"expires_in":    3600,
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	store := newRefreshTestStore(t, configPath, chatgpt.ProviderID, nil)
+	provider, ok := store.Config().Providers.Get(chatgpt.ProviderID)
+	require.True(t, ok)
+	provider.ExtraHeaders[chatgpt.FedRAMPHeader] = "true"
+	provider.ExtraHeaders["X-Custom"] = "custom"
+	store.Config().Providers.Set(chatgpt.ProviderID, provider)
+	writeCodexAuthToDisk(t, configPath, provider.OAuthToken, "account-1")
+	store.chatGPTClient = chatgpt.NewClient(
+		chatgpt.WithHTTPClient(server.Client()),
+		chatgpt.WithIssuerURL(server.URL),
+	)
+
+	require.NoError(t, store.RefreshOAuthToken(context.Background(), ScopeGlobal, chatgpt.ProviderID))
+
+	refreshed, ok := store.Config().Providers.Get(chatgpt.ProviderID)
+	require.True(t, ok)
+	require.Equal(t, "account-1", refreshed.ExtraHeaders[chatgpt.AccountIDHeader])
+	require.Equal(t, chatgpt.Originator, refreshed.ExtraHeaders[chatgpt.OriginatorHeader])
+	require.Equal(t, "custom", refreshed.ExtraHeaders["X-Custom"])
+	require.NotContains(t, refreshed.ExtraHeaders, chatgpt.FedRAMPHeader)
+
+	data, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+	var persisted map[string]any
+	require.NoError(t, json.Unmarshal(data, &persisted))
+	headers := persisted["providers"].(map[string]any)[chatgpt.ProviderID].(map[string]any)["extra_headers"].(map[string]any)
+	require.Equal(t, "account-1", headers[chatgpt.AccountIDHeader])
+	require.NotContains(t, headers, chatgpt.FedRAMPHeader)
 }
 
 func TestRefreshOAuthToken_AdoptsCodexAccountMetadata(t *testing.T) {
@@ -490,6 +600,17 @@ func TestRefreshOAuthToken_LogoutDoesNotRestoreCredentials(t *testing.T) {
 	require.False(t, store.HasConfigField(ScopeGlobal, "providers."+chatgpt.ProviderID))
 	_, exists := store.Config().Providers.Get(chatgpt.ProviderID)
 	require.False(t, exists)
+}
+
+func TestRefreshLockPathCannotEscapeLockDirectory(t *testing.T) {
+	t.Parallel()
+
+	parent := t.TempDir()
+	store := &ConfigStore{globalDataPath: filepath.Join(parent, "crush.json")}
+	lockPath, err := store.refreshLockPath("../../outside")
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(parent, "locks"), filepath.Dir(lockPath))
+	require.NotContains(t, filepath.Base(lockPath), "outside")
 }
 
 func TestWithRefreshLock_DoesNotWriteWithoutLock(t *testing.T) {

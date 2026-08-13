@@ -82,14 +82,16 @@ type codexLoginStore interface {
 }
 
 func loginCodex(store codexLoginStore, force bool) error {
-	if !force {
-		cfg := store.Config()
-		if cfg != nil {
-			if provider, ok := cfg.Providers.Get(chatgpt.ProviderID); ok && provider.OAuthToken != nil {
+	var previous *oauth.Token
+	cfg := store.Config()
+	if cfg != nil {
+		if provider, ok := cfg.Providers.Get(chatgpt.ProviderID); ok && provider.OAuthToken != nil {
+			if !force {
 				fmt.Println("You are already logged in to ChatGPT Codex.")
 				fmt.Println("Use --force to re-authenticate.")
 				return nil
 			}
+			previous = provider.OAuthToken
 		}
 	}
 
@@ -124,7 +126,12 @@ func loginCodex(store codexLoginStore, force bool) error {
 		return err
 	}
 	if err := persistCodexLogin(store, auth); err != nil {
-		return fmt.Errorf("save ChatGPT Codex credentials: %w", err)
+		return err
+	}
+	if previous != nil {
+		if err := client.Revoke(ctx, previous); err != nil {
+			fmt.Println("Warning: the previous ChatGPT Codex credential could not be revoked. The new login was saved successfully.")
+		}
 	}
 
 	fmt.Println()
@@ -133,11 +140,14 @@ func loginCodex(store codexLoginStore, force bool) error {
 }
 
 func persistCodexLogin(store codexLoginStore, auth chatgpt.AuthResult) error {
-	return store.SetConfigField(
+	if err := store.SetConfigField(
 		config.ScopeGlobal,
 		"providers."+chatgpt.ProviderID,
 		config.NewCodexProviderConfig(auth),
-	)
+	); err != nil {
+		return fmt.Errorf("save ChatGPT Codex credentials: %w", err)
+	}
+	return nil
 }
 
 func loginHyper(ws workspace.Workspace, force bool) error {

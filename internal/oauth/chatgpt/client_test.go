@@ -358,6 +358,51 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	require.NoError(t, json.NewEncoder(w).Encode(value))
 }
 
+func TestClientAllowsSameOriginRedirect(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/accounts/deviceauth/usercode":
+			http.Redirect(w, r, "/redirected", http.StatusTemporaryRedirect)
+		case "/redirected":
+			requireJSONBody(t, r, map[string]string{"client_id": ClientID})
+			writeJSON(t, w, map[string]string{
+				"device_auth_id": "device-id",
+				"user_code":      "ABCD-EFGH",
+				"interval":       "1",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(WithHTTPClient(server.Client()), WithIssuerURL(server.URL))
+	_, err := client.RequestDeviceCode(context.Background())
+	require.NoError(t, err)
+}
+
+func TestClientRejectsCrossOriginRedirect(t *testing.T) {
+	t.Parallel()
+
+	var received atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		received.Store(true)
+	}))
+	t.Cleanup(target.Close)
+
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(issuer.Close)
+
+	client := NewClient(WithHTTPClient(issuer.Client()), WithIssuerURL(issuer.URL))
+	_, err := client.RequestDeviceCode(context.Background())
+	require.ErrorContains(t, err, "refusing cross-origin")
+	require.False(t, received.Load())
+}
+
 func TestParseJWTRequiresExactlyThreeSegments(t *testing.T) {
 	t.Parallel()
 

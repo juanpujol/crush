@@ -84,6 +84,26 @@ func NewClient(options ...Option) *Client {
 	for _, option := range options {
 		option(client)
 	}
+
+	httpClient := *client.httpClient
+	previousCheckRedirect := httpClient.CheckRedirect
+	httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		issuer, err := url.Parse(client.issuerURL)
+		if err != nil {
+			return fmt.Errorf("parse ChatGPT issuer URL: %w", err)
+		}
+		if !sameOrigin(req.URL, issuer) {
+			return errors.New("refusing cross-origin ChatGPT OAuth redirect")
+		}
+		if previousCheckRedirect != nil {
+			return previousCheckRedirect(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	client.httpClient = &httpClient
 	return client
 }
 
@@ -103,9 +123,10 @@ type AuthorizationCode struct {
 
 // AuthResult contains credentials and routing metadata derived from the JWTs.
 type AuthResult struct {
-	Token     *oauth.Token
-	AccountID string
-	FedRAMP   bool
+	Token              *oauth.Token
+	AccountID          string
+	FedRAMP            bool
+	HasRoutingMetadata bool
 }
 
 type userCodeResponse struct {
@@ -323,6 +344,7 @@ func authResult(response tokenResponse, fallbackAccountID string) (AuthResult, e
 		}
 	}
 	accountID := identityClaims.Auth.AccountID
+	hasRoutingMetadata := accountID != ""
 	if response.IDToken == "" && accountID == "" {
 		accountID = fallbackAccountID
 	}
@@ -344,9 +366,10 @@ func authResult(response tokenResponse, fallbackAccountID string) (AuthResult, e
 	}
 
 	return AuthResult{
-		Token:     token,
-		AccountID: accountID,
-		FedRAMP:   identityClaims.Auth.FedRAMP,
+		Token:              token,
+		AccountID:          accountID,
+		FedRAMP:            identityClaims.Auth.FedRAMP,
+		HasRoutingMetadata: hasRoutingMetadata,
 	}, nil
 }
 
@@ -416,6 +439,10 @@ func (c *Client) execute(req *http.Request, responseBody any) (int, error) {
 
 func (c *Client) endpoint(path string) string {
 	return strings.TrimRight(c.issuerURL, "/") + "/" + strings.TrimLeft(path, "/")
+}
+
+func sameOrigin(left, right *url.URL) bool {
+	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host)
 }
 
 func readErrorCode(body io.Reader) string {
