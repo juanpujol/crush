@@ -91,6 +91,29 @@ func TestDeviceAuthorization(t *testing.T) {
 	require.Equal(t, int64(3), polls.Load())
 }
 
+func TestRequestDeviceCodeRejectsInvalidInterval(t *testing.T) {
+	t.Parallel()
+
+	for _, interval := range []string{"-1", "9223372037"} {
+		t.Run(interval, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				writeJSON(t, w, map[string]string{
+					"device_auth_id": "device-id",
+					"user_code":      "ABCD-EFGH",
+					"interval":       interval,
+				})
+			}))
+			t.Cleanup(server.Close)
+
+			client := NewClient(WithHTTPClient(server.Client()), WithIssuerURL(server.URL))
+			_, err := client.RequestDeviceCode(context.Background())
+			require.ErrorContains(t, err, "invalid polling interval")
+		})
+	}
+}
+
 func TestPollAuthorizationRejectsMismatchedChallenge(t *testing.T) {
 	t.Parallel()
 

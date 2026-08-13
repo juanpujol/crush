@@ -153,9 +153,9 @@ func (c *Client) RequestDeviceCode(ctx context.Context) (DeviceCode, error) {
 		return DeviceCode{}, errors.New("request ChatGPT device code: response is missing required fields")
 	}
 
-	interval, err := strconv.ParseUint(string(result.Interval), 10, 64)
-	if err != nil {
-		return DeviceCode{}, fmt.Errorf("request ChatGPT device code: invalid polling interval: %w", err)
+	interval, err := strconv.ParseInt(string(result.Interval), 10, 64)
+	if err != nil || interval < 0 || interval > int64((1<<63-1)/time.Second) {
+		return DeviceCode{}, fmt.Errorf("request ChatGPT device code: invalid polling interval %q", result.Interval)
 	}
 
 	return DeviceCode{

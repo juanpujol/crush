@@ -1,5 +1,8 @@
 # Crush
 
+> [!IMPORTANT]
+> This is an unofficial, independently maintained fork of [Charmbracelet Crush](https://github.com/charmbracelet/crush) that adds support for using ChatGPT Codex subscriptions. It is not affiliated with or supported by Charmbracelet or OpenAI. Upstream installation commands below install the official version and do not include this fork's Codex subscription support.
+
 <p align="center">
     <a href="https://stuff.charm.sh/crush/charm-crush.png"><img width="450" alt="Charm Crush Logo" src="https://github.com/user-attachments/assets/cf8ca3ce-8b02-43f0-9d0f-5a331488da4b" /></a><br />
     <a href="https://github.com/charmbracelet/crush/releases"><img src="https://img.shields.io/github/release/charmbracelet/crush" alt="Latest Release"></a>
