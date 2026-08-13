@@ -1,0 +1,91 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/charmbracelet/crush.git
+          git fetch upstream main --tags
+
+      - name: Check for updates
+        id: updates
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short upstream/main)" >> "$GITHUB_OUTPUT"
+          echo "release=$(git describe --tags --abbrev=0 upstream/main 2>/dev/null || echo unreleased)" >> "$GITHUB_OUTPUT"
+
+      - name: Update sync branch
+        if: steps.updates.outputs.available == 'true'
+        run: git push --force origin upstream/main:refs/heads/sync/upstream-main
+
+      - name: Open or update pull request
+        if: steps.updates.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          COMMIT: ${{ steps.updates.outputs.commit }}
+          RELEASE: ${{ steps.updates.outputs.release }}
+        run: |
+          body=$(cat <<EOF
+          Sync this fork with the latest upstream main branch.
+
+          - Latest upstream release: \`${RELEASE}\`
+          - Upstream commit: \`${COMMIT}\`
+          - Review conflicts and wait for all CI checks before merging.
+
+          This pull request is maintained automatically by the upstream sync workflow.
+          EOF
+          )
+
+          number=$(gh pr list \
+            --base main \
+            --head sync/upstream-main \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$number" ]; then
+            gh pr edit "$number" \
+              --add-assignee "${{ github.repository_owner }}" \
+              --title "chore: sync with upstream ${RELEASE}" \
+              --body "$body"
+          else
+            gh pr create \
+              --base main \
+              --head sync/upstream-main \
+              --assignee "${{ github.repository_owner }}" \
+              --title "chore: sync with upstream ${RELEASE}" \
+              --body "$body"
+            number=$(gh pr list \
+              --base main \
+              --head sync/upstream-main \
+              --state open \
+              --json number \
+              --jq '.[0].number')
+          fi
+
+          gh pr merge "$number" --auto --merge
