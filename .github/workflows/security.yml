@@ -79,7 +79,7 @@ jobs:
 
   dependency-review:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.repository == 'charmbracelet/crush'
     permissions:
       contents: read
     steps:
