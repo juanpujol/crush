@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,9 +85,11 @@ func TestCodexProviderPersistencePreservesOpenAI(t *testing.T) {
 	codex.Models = []catwalk.Model{{ID: "gpt-5-codex", Name: "GPT-5 Codex"}}
 
 	require.NoError(t, store.SetConfigField(ScopeGlobal, "providers.openai-codex", codex))
-	info, err := os.Stat(configPath)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(configPath)
+		require.NoError(t, err)
+		require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	}
 	data, err := os.ReadFile(configPath)
 	require.NoError(t, err)
 	require.Equal(t, "openai-key", jsonPathString(t, data, "providers", "openai", "api_key"))
